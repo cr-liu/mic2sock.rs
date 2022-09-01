@@ -10,9 +10,10 @@ pub struct Config {
 
 #[derive(Serialize, Deserialize)]
 pub struct MicConfig {
-    pub mic_id: u16,
-    pub channels: u16,
-    pub sample_rate: u16
+    pub driver: String,
+    pub device_name: String,
+    pub sample_rate: u16,
+    pub period: u16,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -31,9 +32,10 @@ impl Config {
                 println!("Failed reading config.toml! {}", err);
                 let conf = Config {
                     mic: MicConfig {
-                        mic_id: 0,
-                        channels: 8,
+                        driver: "alsa".to_string(),
+                        device_name: "hw:seeed8micvoicec".to_string(),
                         sample_rate: 16000,
+                        period: 16,
                     },
                     tcp: TcpConfig {
                         listen_port: 2345,

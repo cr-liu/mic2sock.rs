@@ -1,3 +1,4 @@
 **/.*
 !.gitignore
 /target
+libjack.0.dylib

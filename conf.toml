@@ -1,0 +1,8 @@
+[mic]
+driver = "alsa"
+device_name = "hw:seeed8micvoicec"
+sample_rate = 16000
+
+[tcp]
+listen_port = 2345
+max_clients = 10

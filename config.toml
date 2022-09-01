@@ -1,7 +1,8 @@
 [mic]
-mic_id = 0
-channels = 8
+driver = "coreaudio"
+device_name = "default"
 sample_rate = 16000
+period = 16
 
 [tcp]
 listen_port = 12345

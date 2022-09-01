@@ -1,12 +1,14 @@
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, Error>;
 
-mod mic_in;
+mod system_call;
+mod jack_client;
 mod config_file;
 mod tcp_server;
 
 mod ring_buf;
 
+use std::sync::Arc;
 use arc_swap::ArcSwap;
 use ring_buf::RingBuf;
 
@@ -23,17 +25,22 @@ static mut MIC_ID: u16 = 0;
 
 #[tokio::main]
 async fn main() {
-    use config_file::Config;
-    let conf = Config::new();
-    unsafe {
-        MIC_ID = conf.mic.mic_id;
-    }
 
-    use mic_in::MicInput;
-    let pcm_in = MicInput::new(SAMPLE_RATE);
-    MicInput::list_devices();
-    
+    use config_file::Config;
+    let conf = Arc::new(Config::new());
+
     use tokio;
+    use std::process::Command;
+
+    use system_call::start_jack;
+    let conf_copy = conf.clone();
+    let jack_server = tokio::spawn( async move {
+        start_jack(conf_copy, tokio::signal::ctrl_c()).await;
+    }); 
+
+    use jack_client::JackClinet;
+    // let audio_client = jack_client::JackClinet::new();
+
     use tokio::sync::Notify;
     use tcp_server::start_server;
     let (listen_port, max_clients) = (conf.tcp.listen_port, conf.tcp.max_clients);
@@ -44,7 +51,6 @@ async fn main() {
 
     let mut rb = RingBuf::new(6, 0u16);
 
-    use std::sync::Arc;
     let mut audio_buf: Arc<[u16; PACKET_LEN]> = Arc::new([0u16; PACKET_LEN]);
     let packet_buf: Arc<[u16; PACKET_LEN]> = Arc::new([0u16; PACKET_LEN]);
     let mut packet_buf: Arc<ArcSwap<[u16; PACKET_LEN]>> = Arc::new(ArcSwap::new(packet_buf));
@@ -82,7 +88,9 @@ async fn main() {
     // print(&d);
 
 
-    // tcp_thread.await;
+    tcp_thread.await;
+
+    jack_server.await;
 }
 
 fn print(a: &ArcSwap<[u16; 5]>) {

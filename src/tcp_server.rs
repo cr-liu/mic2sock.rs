@@ -118,7 +118,7 @@ pub async fn start_server(port: u16, max_clients: u16, notify_data_ready: Arc<No
             }
         }
         _ = shutdown => {
-            println!("received SIGINT; cleaning up tcp server");
+            println!("\ncleaning up tcp server");
         }
     }
 }
