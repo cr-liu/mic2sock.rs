@@ -1,10 +1,10 @@
-use std::sync::Arc;
 use std::future::Future;
+use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, Semaphore, Notify};
+use tokio::sync::{broadcast, Notify, Semaphore};
 use tokio::time::{self, Duration};
 
-use crate::{ Connection, Shutdown };
+use crate::{Connection, Shutdown};
 
 pub struct TcpServer {
     port: u16,
@@ -15,7 +15,11 @@ pub struct TcpServer {
 }
 
 impl TcpServer {
-    pub async fn new(port: u16, max_clients: u16, notify_data_ready: Arc<Notify>) -> crate::Result<TcpServer> {
+    pub async fn new(
+        port: u16,
+        max_clients: u16,
+        notify_data_ready: Arc<Notify>,
+    ) -> crate::Result<TcpServer> {
         let addr = format!("{}:{}", "127.0.0.1", port);
         let listener = TcpListener::bind(addr).await?;
         let (notify_shutdown, _) = broadcast::channel(1);
@@ -34,7 +38,12 @@ impl TcpServer {
         println!("listen on port: {}", self.port);
 
         loop {
-            let permit = self.limit_connections.clone().acquire_owned().await.unwrap();
+            let permit = self
+                .limit_connections
+                .clone()
+                .acquire_owned()
+                .await
+                .unwrap();
             let socket = self.accept().await?;
             socket.set_nodelay(true)?;
             let ip_addr = socket.peer_addr().unwrap().to_string();
@@ -109,8 +118,15 @@ impl Drop for ConnectionHandler {
 }
 
 // Run tcp server; SIGINT ('tokio::signal::ctrl_c()') can be used as 'shutdown' argument.
-pub async fn start_server(port: u16, max_clients: u16, notify_data_ready: Arc<Notify>, shutdown: impl Future) {
-    let mut server = TcpServer::new(port, max_clients, notify_data_ready).await.unwrap();
+pub async fn start_server(
+    port: u16,
+    max_clients: u16,
+    notify_data_ready: Arc<Notify>,
+    shutdown: impl Future,
+) {
+    let mut server = TcpServer::new(port, max_clients, notify_data_ready)
+        .await
+        .unwrap();
     tokio::select! {
         res = server.run() => {
             if let Err(err) = res {
@@ -118,7 +134,7 @@ pub async fn start_server(port: u16, max_clients: u16, notify_data_ready: Arc<No
             }
         }
         _ = shutdown => {
-            println!("\ncleaning up tcp server");
+            println!("cleaning up tcp server");
         }
     }
 }

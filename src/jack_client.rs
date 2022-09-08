@@ -1,18 +1,10 @@
+use crate::config_file::Config;
+use crate::PACKET_LEN;
+use jack::RingBufferWriter;
+use std::future::Future;
+use std::sync::Arc;
+use tokio::sync::Notify;
 
-pub struct JackClinet{
-    client: jack::Client,
-
-}
-
-impl JackClinet {
-    pub fn new() -> JackClinet {
-        let (client, _status) =
-            jack::Client::new("rust_client", jack::ClientOptions::NO_START_SERVER)
-            .unwrap();
-        
-        JackClinet { client }
-    }
-}
 struct Notifications;
 
 impl jack::NotificationHandler for Notifications {
@@ -94,7 +86,116 @@ impl jack::NotificationHandler for Notifications {
     }
 
     fn xrun(&mut self, _: &jack::Client) -> jack::Control {
-        println!("JACK: xrun occurred");
+        println!("JACK: xrun occurred! consider increasing period");
         jack::Control::Continue
     }
+}
+
+pub fn inspect_device() -> (jack::Client, usize) {
+    let (client, _status) =
+        jack::Client::new("rust_client", jack::ClientOptions::NO_START_SERVER).unwrap();
+
+    let in_ports_name = client.ports(Some("capture"), None, jack::PortFlags::IS_PHYSICAL);
+    let out_ports_name = client.ports(Some("playback"), None, jack::PortFlags::IS_PHYSICAL);
+    println!("physical input: {:?}", in_ports_name);
+    println!("physical output: {:?}", out_ports_name);
+    (client, in_ports_name.len())
+}
+
+pub async fn start_jack_client(
+    cfg: Arc<Config>,
+    client: jack::Client,
+    notifier: Arc<Notify>,
+    mut buf_writer: RingBufferWriter,
+    shutdown: impl Future,
+) {
+    let mut i16_buf = [0_i16; PACKET_LEN];
+    let mut i_period = 0_usize;
+    let period = cfg.mic.period as usize;
+    let n_period = PACKET_LEN / cfg.mic.period as usize;
+    let in_ports_name = client.ports(Some("capture"), None, jack::PortFlags::IS_PHYSICAL);
+    let out_ports_name = client.ports(Some("playback"), None, jack::PortFlags::IS_PHYSICAL);
+    let n_ch = std::cmp::min(in_ports_name.len(), cfg.mic.n_channel);
+    let mut n_ch_buf = vec![[0.0_f32; PACKET_LEN]; n_ch];
+
+    let mut in_ports = Vec::<jack::Port<jack::AudioIn>>::new();
+    for i in 0..in_ports_name.len() {
+        in_ports.push(
+            client
+                .register_port(format!("in_{i}").as_str(), jack::AudioIn::default())
+                .unwrap(),
+        );
+    }
+
+    // {
+    let process_callback = move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
+        for (i, port) in in_ports.iter().enumerate() {
+            let in_data = port.as_slice(ps);
+            let write_pos = i_period * period as usize;
+            n_ch_buf[i][write_pos..write_pos + period as usize].copy_from_slice(in_data);
+        }
+        i_period += 1;
+        if i_period == n_period {
+            i_period = 0;
+            for i in 0..n_ch_buf.len() {
+                for j in 0..n_ch_buf[i].len() {
+                    i16_buf[j] = pcm_f32_to_i16(n_ch_buf[i][j]);
+                }
+                buf_writer.write_buffer(slice_i16_to_u8(i16_buf.as_ref()));
+                // emit reading signal here
+                notifier.notify_one();
+            }
+        }
+
+        jack::Control::Continue
+    };
+    let process = jack::ClosureProcessHandler::new(process_callback);
+    let active_client = client.activate_async(Notifications, process).unwrap();
+
+    for (i, port_name) in in_ports_name.iter().enumerate() {
+        active_client
+            .as_client()
+            .connect_ports_by_name(port_name, format!("rust_client:in_{i}").as_str())
+            .unwrap();
+    }
+    let (mic_idx, speaker_idx) = (
+        cfg.audio_connection.mic_idx as usize,
+        cfg.audio_connection.speaker_idx as usize,
+    );
+    if cfg.audio_connection.connect_mic_speaker
+        && in_ports_name.len() > mic_idx
+        && out_ports_name.len() > speaker_idx
+    {
+        active_client
+            .as_client()
+            .connect_ports_by_name(
+                in_ports_name[mic_idx].as_str(),
+                // "rust_in_0",
+                out_ports_name[speaker_idx].as_str(),
+            )
+            .unwrap();
+    }
+
+    shutdown.await;
+    println!("shutting down jack client");
+    active_client.deactivate().unwrap();
+    // }
+}
+
+#[inline(always)]
+fn slice_i16_to_u8(slice: &[i16]) -> &[u8] {
+    let byte_len = slice.len() * 2;
+    unsafe { std::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), byte_len) }
+}
+
+#[inline(always)]
+fn pcm_f32_to_i16(s: f32) -> i16 {
+    let mut i = (s * 32768.0).round() as i32;
+    if i > 32767 {
+        i = 32767;
+    }
+    if i < -32768 {
+        i = -32768;
+    }
+    i as i16
 }
