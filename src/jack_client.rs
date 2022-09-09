@@ -1,5 +1,5 @@
 use crate::config_file::Config;
-use crate::PACKET_LEN;
+use crate::PACKET_N_SAMPLE;
 use jack::RingBufferWriter;
 use std::future::Future;
 use std::sync::Arc;
@@ -109,14 +109,14 @@ pub async fn start_jack_client(
     mut buf_writer: RingBufferWriter,
     shutdown: impl Future,
 ) {
-    let mut i16_buf = [0_i16; PACKET_LEN];
+    let mut i16_buf = [0_i16; PACKET_N_SAMPLE];
     let mut i_period = 0_usize;
-    let period = cfg.mic.period as usize;
-    let n_period = PACKET_LEN / cfg.mic.period as usize;
+    let period = cfg.mic.period;
+    let n_period = PACKET_N_SAMPLE / cfg.mic.period;
     let in_ports_name = client.ports(Some("capture"), None, jack::PortFlags::IS_PHYSICAL);
     let out_ports_name = client.ports(Some("playback"), None, jack::PortFlags::IS_PHYSICAL);
     let n_ch = std::cmp::min(in_ports_name.len(), cfg.mic.n_channel);
-    let mut n_ch_buf = vec![[0.0_f32; PACKET_LEN]; n_ch];
+    let mut n_ch_buf = vec![[0.0_f32; PACKET_N_SAMPLE]; n_ch];
 
     let mut in_ports = Vec::<jack::Port<jack::AudioIn>>::new();
     for i in 0..in_ports_name.len() {
@@ -170,7 +170,6 @@ pub async fn start_jack_client(
             .as_client()
             .connect_ports_by_name(
                 in_ports_name[mic_idx].as_str(),
-                // "rust_in_0",
                 out_ports_name[speaker_idx].as_str(),
             )
             .unwrap();

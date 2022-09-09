@@ -4,8 +4,6 @@ use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::MIC_ID;
-
 /// Send and receive `Frame` values from a remote peer.
 ///
 /// When implementing networking protocols, a message on that protocol is
@@ -43,13 +41,8 @@ impl Connection {
             // this is fine. However, real applications will want to tune this
             // value to their specific use case. There is a high likelihood that
             // a larger read buffer will work better.
-
             buffer: BytesMut::with_capacity(4 * 1024),
         }
-    }
-
-    pub fn set_mic_id(&mut self) {
-        unsafe { self.mic_id = MIC_ID; }
     }
 
     /// Read a single `Frame` value from the underlying stream.
@@ -86,7 +79,9 @@ impl Connection {
 
     pub async fn write_packet(&mut self) -> crate::Result<()> {
         let now_in_ms = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis();
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
         let now_in_s: u32 = (now_in_ms / 1000).try_into().unwrap();
         let ms: u16 = (now_in_ms % 1000).try_into().unwrap();
 

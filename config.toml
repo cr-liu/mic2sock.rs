@@ -2,6 +2,7 @@
 driver = "coreaudio"
 # driver = "alsa"
 device_name = "default"
+device_id = 0
 sample_rate = 16000
 period = 16
 n_channel = 8

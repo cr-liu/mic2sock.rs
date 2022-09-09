@@ -16,8 +16,9 @@ pub struct Config {
 pub struct MicConfig {
     pub driver: String,
     pub device_name: String,
-    pub sample_rate: u16,
-    pub period: u16,
+    pub device_id: usize,
+    pub sample_rate: usize,
+    pub period: usize,
     pub n_channel: usize,
 }
 
@@ -45,6 +46,7 @@ impl Config {
                     mic: MicConfig {
                         driver: "alsa".to_string(),
                         device_name: "hw:seeed8micvoicec".to_string(),
+                        device_id: 0,
                         sample_rate: 16000,
                         period: 16,
                         n_channel: 8,
