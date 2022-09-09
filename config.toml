@@ -4,7 +4,7 @@ driver = "coreaudio"
 device_name = "default"
 sample_rate = 16000
 period = 16
-n_mic = 8
+n_channel = 8
 
 [audio_connection]
 # connect_mic_speaker = true
