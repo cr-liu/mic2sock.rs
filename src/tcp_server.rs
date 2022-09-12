@@ -27,7 +27,7 @@ impl TcpServer {
         data_to_send: Arc<ArcSwap<BytesMut>>,
     ) -> crate::Result<TcpServer> {
         let addr = format!("{}:{}", "127.0.0.1", port);
-        let listener = TcpListener::bind(addr).await?;
+        let listener = TcpListener::bind(&addr).await?;
         let (notify_shutdown, _) = broadcast::channel(1);
         let (shutdown_complete_tx, shutdown_complete_rx) = mpsc::channel(1);
 
@@ -56,13 +56,12 @@ impl TcpServer {
             let socket = self.accept().await?;
             socket.set_nodelay(true)?;
             let ip_addr = socket.peer_addr().unwrap().to_string();
-            let connection = Connection::new(socket);
+            let connection = Connection::new(socket, self.data_to_send.clone());
 
             let mut handler = ConnectionHandler {
                 connection,
                 ip_addr,
                 notified_data_ready: self.notify_data_ready.clone(),
-                data_to_send: self.data_to_send.clone(),
                 shutdown: false,
                 shutdown_signal: self.notify_shutdown.subscribe(),
                 _shutdown_complete: self.shutdown_complete_tx.clone(),
@@ -103,7 +102,6 @@ pub struct ConnectionHandler {
     connection: Connection,
     ip_addr: String,
     notified_data_ready: Arc<Notify>,
-    data_to_send: Arc<ArcSwap<BytesMut>>,
     shutdown: bool,
     shutdown_signal: broadcast::Receiver<()>,
     _shutdown_complete: mpsc::Sender<()>,
@@ -115,8 +113,8 @@ impl ConnectionHandler {
         while !self.shutdown {
             self.notified_data_ready.notified().await;
             tokio::select! {
-                res = self.connection.write_packet() => {
-                    return res;
+                _res = self.connection.write_packet() => {
+                    // return res;
                 }
                 _ = self.shutdown_signal.recv() => {
                     self.shutdown = true;

@@ -14,5 +14,5 @@ mic_idx = 0
 speaker_idx = 0
 
 [tcp]
-listen_port = 12345
+listen_port = 2345
 max_clients = 10
