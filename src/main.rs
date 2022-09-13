@@ -9,9 +9,8 @@ mod config_file;
 use config_file::Config;
 mod tcp_server;
 use tcp_server::start_server;
-mod connection;
-use connection::Connection;
 mod ring_buf;
+mod socket;
 
 use arc_swap::ArcSwap;
 use bytes::{BufMut, BytesMut};
@@ -54,6 +53,7 @@ async fn main() {
     let notify_dump_data_cp = notify_dump_data.clone();
     let notify_data_ready_cp = notify_data_ready.clone();
     let _buf_thread = tokio::spawn(async move {
+        let mut pkt_id = 0_u32;
         loop {
             notify_dump_data_cp.notified().await;
             // println!("ringbuf len: {}", ringbuf_reader.space());
@@ -64,17 +64,23 @@ async fn main() {
                 .unwrap()
                 .as_millis()
                 - 10;
-            let secs = (unix_time_in_millis / 1000) as u64;
+            let secs = (unix_time_in_millis / 1000) as u32;
             let millis = (unix_time_in_millis % 1000) as u16;
-            swap_buf_mut.put_u64(secs);
-            swap_buf_mut.put_u16(millis);
             swap_buf_mut.put_u16(device_id as u16);
+            swap_buf_mut.put_u32(secs);
+            swap_buf_mut.put_u16(millis);
+            swap_buf_mut.put_u32(pkt_id);
 
             let _read_size = ringbuf_reader.read_buffer(audio_data_buf.as_mut());
             swap_buf_mut.extend_from_slice(audio_data_buf.as_ref());
 
             swap_buf = pkt_buf_mut.swap(swap_buf);
             notify_data_ready_cp.notify_waiters();
+
+            pkt_id += 1;
+            if pkt_id == std::u32::MAX {
+                pkt_id = 0;
+            }
         }
     });
 

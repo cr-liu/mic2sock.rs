@@ -1,3 +1,4 @@
+use crate::socket::{SocketReader, SocketWriter};
 use arc_swap::ArcSwap;
 use bytes::BytesMut;
 use std::future::Future;
@@ -5,8 +6,6 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, Notify, Semaphore};
 use tokio::time::{self, Duration};
-
-use crate::Connection;
 
 pub struct TcpServer {
     port: u16,
@@ -56,11 +55,16 @@ impl TcpServer {
             let socket = self.accept().await?;
             socket.set_nodelay(true)?;
             let ip_addr = socket.peer_addr().unwrap().to_string();
-            let connection = Connection::new(socket, self.data_to_send.clone());
+            let (read_half, write_half) = socket.into_split();
 
-            let mut handler = ConnectionHandler {
-                connection,
+            let mut handler = SocketHandler {
+                // socket,
                 ip_addr,
+                socket_reader: SocketReader { reader: read_half },
+                socket_writer: SocketWriter {
+                    writer: write_half,
+                    data_to_send: self.data_to_send.clone(),
+                },
                 notified_data_ready: self.notify_data_ready.clone(),
                 shutdown: false,
                 shutdown_signal: self.notify_shutdown.subscribe(),
@@ -98,26 +102,31 @@ impl TcpServer {
     }
 }
 
-pub struct ConnectionHandler {
-    connection: Connection,
+pub struct SocketHandler {
     ip_addr: String,
+    socket_reader: SocketReader,
+    socket_writer: SocketWriter,
     notified_data_ready: Arc<Notify>,
     shutdown: bool,
     shutdown_signal: broadcast::Receiver<()>,
     _shutdown_complete: mpsc::Sender<()>,
 }
 
-impl ConnectionHandler {
+impl SocketHandler {
     // todo: return Result<()>
     async fn run(&mut self) -> crate::Result<()> {
         while !self.shutdown {
             self.notified_data_ready.notified().await;
             tokio::select! {
-                _res = self.connection.write_packet() => {
-                    // return res;
+                _ = self.socket_writer.write_packet() => {}
+                Ok(read_size) = self.socket_reader.read_packet() => {
+                    if read_size == 0 {
+                        return Ok(());
+                    }
                 }
                 _ = self.shutdown_signal.recv() => {
                     self.shutdown = true;
+                    // drop(self.socket_writer.writer);
                     return Ok(());
                 }
             };
@@ -126,7 +135,7 @@ impl ConnectionHandler {
     }
 }
 
-impl Drop for ConnectionHandler {
+impl Drop for SocketHandler {
     fn drop(&mut self) {
         println!("{} disconnected", self.ip_addr);
     }
