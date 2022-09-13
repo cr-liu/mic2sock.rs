@@ -25,7 +25,7 @@ impl TcpServer {
         notify_data_ready: Arc<Notify>,
         data_to_send: Arc<ArcSwap<BytesMut>>,
     ) -> crate::Result<TcpServer> {
-        let addr = format!("{}:{}", "127.0.0.1", port);
+        let addr = format!("{}:{}", "0.0.0.0", port);
         let listener = TcpListener::bind(&addr).await?;
         let (notify_shutdown, _) = broadcast::channel(1);
         let (shutdown_complete_tx, shutdown_complete_rx) = mpsc::channel(1);
