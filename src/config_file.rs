@@ -1,13 +1,16 @@
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{self, Write},
+    io::Write,
 };
 use toml;
+
+type Error = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Serialize, Deserialize)]
 pub struct Config {
     pub mic: MicConfig,
+    pub speaker: SpeakerConfig,
     pub audio_connection: AudioConnection,
     pub tcp: TcpConfig,
 }
@@ -23,16 +26,27 @@ pub struct MicConfig {
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct SpeakerConfig {
+    pub device_name: String,
+    pub sample_rate: usize,
+    pub period: usize,
+    pub n_period: usize,
+    pub n_channel: usize,
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct AudioConnection {
     pub connect_mic_speaker: bool,
-    pub mic_idx: u16,
-    pub speaker_idx: u16,
+    pub mic_idx: usize,
+    pub speaker_idx: usize,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct TcpConfig {
-    pub listen_port: u16,
-    pub max_clients: u16,
+    pub listen_port: usize,
+    pub max_clients: usize,
+    pub header_len: usize,
+    pub sample_per_packet: usize,
 }
 
 impl Config {
@@ -45,11 +59,18 @@ impl Config {
                 let conf = Config {
                     mic: MicConfig {
                         driver: "alsa".to_string(),
-                        device_name: "hw:seeed8micvoicec".to_string(),
+                        device_name: "hw:RASPZX16ch".to_string(),
                         device_id: 0,
                         sample_rate: 16000,
-                        period: 16,
-                        n_channel: 8,
+                        period: 32,
+                        n_channel: 16,
+                    },
+                    speaker: SpeakerConfig { 
+                        device_name: "plughw:Device".to_string(),
+                        sample_rate: 16000,
+                        period: 32,
+                        n_period: 2,
+                        n_channel: 1,
                     },
                     audio_connection: AudioConnection {
                         connect_mic_speaker: false,
@@ -59,6 +80,8 @@ impl Config {
                     tcp: TcpConfig {
                         listen_port: 2345,
                         max_clients: 10,
+                        header_len: 12,
+                        sample_per_packet: 160,
                     },
                 };
                 let toml = toml::to_string(&conf).unwrap();
@@ -73,7 +96,7 @@ impl Config {
         }
     }
 
-    fn read_conf_file() -> Result<Config, io::Error> {
+    fn read_conf_file() -> Result<Config, Error> {
         let contents = fs::read_to_string("config.toml")?;
         let conf: Config = toml::from_str(&contents)?;
         Ok(conf)

@@ -1,6 +1,5 @@
 use crate::config_file::Config;
-use crate::PACKET_N_SAMPLE;
-use jack::RingBufferWriter;
+use jack::{RingBufferWriter, RingBufferReader};
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -91,86 +90,109 @@ impl jack::NotificationHandler for Notifications {
     }
 }
 
-pub fn inspect_device() -> (jack::Client, usize) {
+pub fn inspect_device() -> (jack::Client, usize, usize) {
     let (client, _status) =
         jack::Client::new("rust_client", jack::ClientOptions::NO_START_SERVER).unwrap();
 
     let in_ports_name = client.ports(Some("capture"), None, jack::PortFlags::IS_PHYSICAL);
-    let out_ports_name = client.ports(Some("playback"), None, jack::PortFlags::IS_PHYSICAL);
+    let out_ports_name = client.ports(Some("playback"), None, jack::PortFlags::IS_INPUT);
     println!("physical input: {:?}", in_ports_name);
     println!("physical output: {:?}", out_ports_name);
-    (client, in_ports_name.len())
+    (client, in_ports_name.len(), out_ports_name.len())
 }
 
 pub async fn start_jack_client(
     cfg: Arc<Config>,
     client: jack::Client,
     notifier: Arc<Notify>,
-    mut buf_writer: RingBufferWriter,
+    mut buf_writers: Vec<RingBufferWriter>,
+    mut playback_buf_readers: Vec<RingBufferReader>,
     shutdown: impl Future,
 ) {
-    let mut i16_buf = [0_i16; PACKET_N_SAMPLE];
-    let mut i_period = 0_usize;
+    let mut i16_buf = vec![0_i16; cfg.mic.period];
     let period = cfg.mic.period;
-    let n_period = PACKET_N_SAMPLE / cfg.mic.period;
+    let sample_per_packet = cfg.tcp.sample_per_packet;
+    let mut i_sample : usize = 0;
+
     let in_ports_name = client.ports(Some("capture"), None, jack::PortFlags::IS_PHYSICAL);
-    let out_ports_name = client.ports(Some("playback"), None, jack::PortFlags::IS_PHYSICAL);
-    let n_ch = std::cmp::min(in_ports_name.len(), cfg.mic.n_channel);
-    let mut n_ch_buf = vec![[0.0_f32; PACKET_N_SAMPLE]; n_ch];
+    let out_ports_name = client.ports(Some("playback"), None, jack::PortFlags::IS_INPUT);
 
     let mut in_ports = Vec::<jack::Port<jack::AudioIn>>::new();
-    for i in 0..in_ports_name.len() {
+    for i in 0..cfg.mic.n_channel {
         in_ports.push(
             client
                 .register_port(format!("in_{i}").as_str(), jack::AudioIn::default())
-                .unwrap(),
+                .unwrap()
         );
     }
+    let mut out_ports = Vec::<jack::Port<jack::AudioOut>>::new();
+    for i in 0..cfg.speaker.n_channel {
+        out_ports.push(
+            client
+                .register_port(format!("out_{i}").as_str(), jack::AudioOut::default())
+                .unwrap()
+        );
+        
+    }
 
-    // {
+    // jack client will call this function each period
     let process_callback = move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
         for (i, port) in in_ports.iter().enumerate() {
             let in_data = port.as_slice(ps);
-            let write_pos = i_period * period as usize;
-            n_ch_buf[i][write_pos..write_pos + period as usize].copy_from_slice(in_data);
-        }
-        i_period += 1;
-        if i_period == n_period {
-            i_period = 0;
-            for i in 0..n_ch_buf.len() {
-                for j in 0..n_ch_buf[i].len() {
-                    i16_buf[j] = pcm_f32_to_i16(n_ch_buf[i][j]);
-                }
-                buf_writer.write_buffer(slice_i16_to_u8(i16_buf.as_ref()));
-                // emit reading signal here
-                notifier.notify_one();
+            assert_eq!(in_data.len(), period);
+            for j in 0..period {
+                i16_buf[j] = pcm_f32_to_i16(in_data[j]);
             }
+            buf_writers[i].write_buffer(slice_i16_to_u8(i16_buf.as_slice()));
+        }
+        i_sample += period;
+        if i_sample >= sample_per_packet {
+            notifier.notify_one();
+            i_sample -= sample_per_packet;
+        }
+
+        if out_ports.len() == 0 || playback_buf_readers[0].space() < period * 2 { 
+            return jack::Control::Continue; 
+        }
+        for i in 0..out_ports.len() {
+            let out_data_mut= out_ports[i].as_mut_slice(ps);
+            let n_bytes = playback_buf_readers[i].read_buffer(slice_i16_to_u8_mut(i16_buf.as_mut_slice())); 
+            for j in 0..out_data_mut.len() {
+                out_data_mut[j] = pcm_i16_to_f32(i16_buf[j])
+            }
+            assert_eq!(n_bytes, period *2);
         }
 
         jack::Control::Continue
     };
-    let process = jack::ClosureProcessHandler::new(process_callback);
-    let active_client = client.activate_async(Notifications, process).unwrap();
 
-    for (i, port_name) in in_ports_name.iter().enumerate() {
+    let process = jack::ClosureProcessHandler::new(process_callback);
+    let active_client = 
+        client.activate_async(Notifications, process).unwrap();
+
+    for i in 0..cfg.mic.n_channel {
         active_client
             .as_client()
-            .connect_ports_by_name(port_name, format!("rust_client:in_{i}").as_str())
+            .connect_ports_by_name(&in_ports_name[i], format!("rust_client:in_{i}").as_str())
             .unwrap();
     }
-    let (mic_idx, speaker_idx) = (
-        cfg.audio_connection.mic_idx as usize,
-        cfg.audio_connection.speaker_idx as usize,
-    );
+
+    for i in 0..cfg.speaker.n_channel {
+        active_client
+            .as_client()
+            .connect_ports_by_name(format!("rust_client:out_{i}").as_str(), &out_ports_name[i])
+            .unwrap();
+    }
+
     if cfg.audio_connection.connect_mic_speaker
-        && in_ports_name.len() > mic_idx
-        && out_ports_name.len() > speaker_idx
+        && cfg.mic.n_channel > cfg.audio_connection.mic_idx
+        && cfg.speaker.n_channel > cfg.audio_connection.speaker_idx
     {
         active_client
             .as_client()
             .connect_ports_by_name(
-                in_ports_name[mic_idx].as_str(),
-                out_ports_name[speaker_idx].as_str(),
+                &in_ports_name[cfg.audio_connection.mic_idx].as_str(),
+                &out_ports_name[cfg.audio_connection.speaker_idx].as_str(),
             )
             .unwrap();
     }
@@ -178,13 +200,17 @@ pub async fn start_jack_client(
     shutdown.await;
     println!("shutting down jack client");
     active_client.deactivate().unwrap();
-    // }
 }
 
 #[inline(always)]
 fn slice_i16_to_u8(slice: &[i16]) -> &[u8] {
     let byte_len = slice.len() * 2;
     unsafe { std::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), byte_len) }
+}
+
+fn slice_i16_to_u8_mut(slice: &mut [i16]) -> &mut [u8] {
+    let byte_len = slice.len() * 2;
+    unsafe { std::slice::from_raw_parts_mut(slice.as_ptr().cast::<u8>().cast_mut(), byte_len) }
 }
 
 #[inline(always)]
@@ -197,4 +223,9 @@ fn pcm_f32_to_i16(s: f32) -> i16 {
         i = -32768;
     }
     i as i16
+}
+
+#[inline(always)]
+fn pcm_i16_to_f32(s: i16) -> f32 {
+    s as f32 / 32768.0
 }

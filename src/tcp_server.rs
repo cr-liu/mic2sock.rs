@@ -1,44 +1,40 @@
-use crate::socket::{SocketReader, SocketWriter};
 use arc_swap::ArcSwap;
 use bytes::BytesMut;
+use tokio::io::AsyncWriteExt;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, Notify, Semaphore};
+use tokio::sync::{Semaphore, Notify};
+use tokio::sync::broadcast;
 use tokio::time::{self, Duration};
 
 pub struct TcpServer {
-    port: u16,
+    port: usize,
     listener: TcpListener,
     limit_connections: Arc<Semaphore>,
-    notify_data_ready: Arc<Notify>,
-    data_to_send: Arc<ArcSwap<BytesMut>>,
+    packet_buf: Arc<ArcSwap<BytesMut>>,
+    notifyee: Arc<Notify>,
     notify_shutdown: broadcast::Sender<()>,
-    shutdown_complete_tx: mpsc::Sender<()>,
-    shutdown_complete_rx: mpsc::Receiver<()>,
 }
 
 impl TcpServer {
     pub async fn new(
-        port: u16,
-        max_clients: u16,
-        notify_data_ready: Arc<Notify>,
-        data_to_send: Arc<ArcSwap<BytesMut>>,
+        port: usize,
+        max_clients: usize,
+        packet_buf: Arc<ArcSwap<BytesMut>>,
+        notifyee: Arc<Notify>,
     ) -> crate::Result<TcpServer> {
         let addr = format!("{}:{}", "0.0.0.0", port);
         let listener = TcpListener::bind(&addr).await?;
         let (notify_shutdown, _) = broadcast::channel(1);
-        let (shutdown_complete_tx, shutdown_complete_rx) = mpsc::channel(1);
 
         let server = TcpServer {
             port,
             listener,
             limit_connections: Arc::new(Semaphore::new(max_clients.into())),
-            notify_data_ready,
-            data_to_send,
+            packet_buf,
+            notifyee,
             notify_shutdown,
-            shutdown_complete_tx,
-            shutdown_complete_rx,
         };
         Ok(server)
     }
@@ -55,20 +51,14 @@ impl TcpServer {
             let socket = self.accept().await?;
             socket.set_nodelay(true)?;
             let ip_addr = socket.peer_addr().unwrap().to_string();
-            let (read_half, write_half) = socket.into_split();
 
             let mut handler = SocketHandler {
-                // socket,
                 ip_addr,
-                socket_reader: SocketReader { reader: read_half },
-                socket_writer: SocketWriter {
-                    writer: write_half,
-                    data_to_send: self.data_to_send.clone(),
-                },
-                notified_data_ready: self.notify_data_ready.clone(),
+                socket,
+                packet_buf: self.packet_buf.clone(),
+                notifyee: self.notifyee.clone(),
                 shutdown: false,
                 shutdown_signal: self.notify_shutdown.subscribe(),
-                _shutdown_complete: self.shutdown_complete_tx.clone(),
             };
 
             tokio::spawn(async move {
@@ -76,6 +66,7 @@ impl TcpServer {
                     println!("Error! Connection error. {}", err);
                 }
                 drop(permit);
+                drop(handler);
             });
         }
     }
@@ -104,33 +95,31 @@ impl TcpServer {
 
 pub struct SocketHandler {
     ip_addr: String,
-    socket_reader: SocketReader,
-    socket_writer: SocketWriter,
-    notified_data_ready: Arc<Notify>,
+    socket: TcpStream,
+    packet_buf: Arc<ArcSwap<BytesMut>>,
+    notifyee: Arc<Notify>,
     shutdown: bool,
     shutdown_signal: broadcast::Receiver<()>,
-    _shutdown_complete: mpsc::Sender<()>,
 }
 
 impl SocketHandler {
-    // todo: return Result<()>
     async fn run(&mut self) -> crate::Result<()> {
         while !self.shutdown {
-            self.notified_data_ready.notified().await;
+            self.notifyee.notified().await;
+            let packet = self.packet_buf.load();
             tokio::select! {
-                _ = self.socket_writer.write_packet() => {}
-                Ok(read_size) = self.socket_reader.read_packet() => {
-                    if read_size == 0 {
-                        return Ok(());
+                res = self.socket.write_all(packet.as_ref()) => {
+                    if let Err(_) = res {
+                        self.shutdown = true;
                     }
                 }
                 _ = self.shutdown_signal.recv() => {
                     self.shutdown = true;
-                    // drop(self.socket_writer.writer);
                     return Ok(());
                 }
             };
         }
+        self.socket.shutdown().await.unwrap();
         Ok(())
     }
 }
@@ -143,13 +132,17 @@ impl Drop for SocketHandler {
 
 // Run tcp server; SIGINT ('tokio::signal::ctrl_c()') can be used as 'shutdown' argument.
 pub async fn start_server(
-    port: u16,
-    max_clients: u16,
-    notify_data_ready: Arc<Notify>,
-    data_to_send: Arc<ArcSwap<BytesMut>>,
+    port: usize,
+    max_clients: usize,
+    packet_buf: Arc<ArcSwap<BytesMut>>,
+    notifyee: Arc<Notify>,
     shutdown: impl Future,
 ) {
-    let mut server = TcpServer::new(port, max_clients, notify_data_ready, data_to_send)
+    let mut server = TcpServer::new(
+        port,
+        max_clients,
+        packet_buf,
+        notifyee)
         .await
         .unwrap();
     tokio::select! {
@@ -159,17 +152,15 @@ pub async fn start_server(
             }
         }
         _ = shutdown => {
-            println!("cleaning up tcp server");
+            println!("Cleaning up tcp server");
         }
     }
 
     let TcpServer {
-        mut shutdown_complete_rx,
-        shutdown_complete_tx,
+        notifyee,
         notify_shutdown,
         ..
     } = server;
+    drop(notifyee);
     drop(notify_shutdown);
-    drop(shutdown_complete_tx);
-    shutdown_complete_rx.recv().await;
 }
