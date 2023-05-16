@@ -4,13 +4,13 @@ driver = "alsa"
 device_name = "hw:RASPZX16ch"
 device_id = 0
 sample_rate = 16000
-period = 64
+period = 32
 n_channel = 16
 
 [speaker]
 device_name = "plughw:Device"
 sample_rate = 16000
-period = 64
+period = 32
 n_period = 4
 n_channel = 1
 
@@ -20,8 +20,15 @@ connect_mic_speaker = false
 mic_idx = 0
 speaker_idx = 0
 
-[tcp]
+[tcp_sender]
 listen_port = 7998
 max_clients = 10
 header_len = 12
+sample_per_packet = 160
+
+[tcp_receiver]
+host = "none"
+port = 7998
+header_len = 12
+n_channel = 17
 sample_per_packet = 160

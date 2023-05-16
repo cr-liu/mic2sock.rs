@@ -1,18 +1,18 @@
-use arc_swap::ArcSwap;
-use bytes::BytesMut;
-use tokio::io::AsyncWriteExt;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use arc_swap::ArcSwap;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, Notify};
 use tokio::sync::broadcast;
 use tokio::time::{self, Duration};
+use tokio::io::AsyncWriteExt;
 
 pub struct TcpServer {
     port: usize,
     listener: TcpListener,
     limit_connections: Arc<Semaphore>,
-    packet_buf: Arc<ArcSwap<BytesMut>>,
+    packet_buf: Arc<ArcSwap<Vec<u8>>>,
     notifyee: Arc<Notify>,
     notify_shutdown: broadcast::Sender<()>,
 }
@@ -21,7 +21,7 @@ impl TcpServer {
     pub async fn new(
         port: usize,
         max_clients: usize,
-        packet_buf: Arc<ArcSwap<BytesMut>>,
+        packet_buf: Arc<ArcSwap<Vec<u8>>>,
         notifyee: Arc<Notify>,
     ) -> crate::Result<TcpServer> {
         let addr = format!("{}:{}", "0.0.0.0", port);
@@ -57,7 +57,7 @@ impl TcpServer {
                 socket,
                 packet_buf: self.packet_buf.clone(),
                 notifyee: self.notifyee.clone(),
-                shutdown: false,
+                shutdown: AtomicBool::new(false),
                 shutdown_signal: self.notify_shutdown.subscribe(),
             };
 
@@ -96,25 +96,25 @@ impl TcpServer {
 pub struct SocketHandler {
     ip_addr: String,
     socket: TcpStream,
-    packet_buf: Arc<ArcSwap<BytesMut>>,
+    packet_buf: Arc<ArcSwap<Vec<u8>>>,
     notifyee: Arc<Notify>,
-    shutdown: bool,
+    shutdown: AtomicBool,
     shutdown_signal: broadcast::Receiver<()>,
 }
 
 impl SocketHandler {
     async fn run(&mut self) -> crate::Result<()> {
-        while !self.shutdown {
+        while self.shutdown.load(Ordering::Relaxed) != true {
             self.notifyee.notified().await;
             let packet = self.packet_buf.load();
             tokio::select! {
                 res = self.socket.write_all(packet.as_ref()) => {
                     if let Err(_) = res {
-                        self.shutdown = true;
+                        self.shutdown.store(true, Ordering::Relaxed);
                     }
                 }
                 _ = self.shutdown_signal.recv() => {
-                    self.shutdown = true;
+                    self.shutdown.store(true, Ordering::Relaxed);
                     return Ok(());
                 }
             };
@@ -134,7 +134,7 @@ impl Drop for SocketHandler {
 pub async fn start_server(
     port: usize,
     max_clients: usize,
-    packet_buf: Arc<ArcSwap<BytesMut>>,
+    packet_buf: Arc<ArcSwap<Vec<u8>>>,
     notifyee: Arc<Notify>,
     shutdown: impl Future,
 ) {

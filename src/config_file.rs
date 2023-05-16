@@ -12,7 +12,8 @@ pub struct Config {
     pub mic: MicConfig,
     pub speaker: SpeakerConfig,
     pub audio_connection: AudioConnection,
-    pub tcp: TcpConfig,
+    pub tcp_sender: TcpSenderConfig,
+    pub tcp_receiver: TcpReceiverConfig,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -42,10 +43,19 @@ pub struct AudioConnection {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct TcpConfig {
+pub struct TcpSenderConfig {
     pub listen_port: usize,
     pub max_clients: usize,
     pub header_len: usize,
+    pub sample_per_packet: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct TcpReceiverConfig {
+    pub host: String,
+    pub port: usize,
+    pub header_len: usize,
+    pub n_channel: usize,
     pub sample_per_packet: usize,
 }
 
@@ -77,11 +87,18 @@ impl Config {
                         mic_idx: 0,
                         speaker_idx: 0,
                     },
-                    tcp: TcpConfig {
+                    tcp_sender: TcpSenderConfig {
                         listen_port: 2345,
                         max_clients: 10,
                         header_len: 12,
                         sample_per_packet: 160,
+                    },
+                    tcp_receiver: TcpReceiverConfig {
+                        host: "localhost".to_string(),
+                        port: 7998,
+                        header_len: 12,
+                        n_channel: 17,
+                        sample_per_packet: 160
                     },
                 };
                 let toml = toml::to_string(&conf).unwrap();

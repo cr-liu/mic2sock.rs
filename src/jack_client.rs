@@ -111,7 +111,7 @@ pub async fn start_jack_client(
 ) {
     let mut i16_buf = vec![0_i16; cfg.mic.period];
     let period = cfg.mic.period;
-    let sample_per_packet = cfg.tcp.sample_per_packet;
+    let sample_per_packet = cfg.tcp_sender.sample_per_packet;
     let mut i_sample : usize = 0;
 
     let in_ports_name = client.ports(Some("capture"), None, jack::PortFlags::IS_PHYSICAL);
