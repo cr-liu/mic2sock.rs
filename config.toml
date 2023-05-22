@@ -22,13 +22,13 @@ speaker_idx = 0
 
 [tcp_sender]
 listen_port = 7998
-max_clients = 10
+max_clients = 100
 header_len = 12
 sample_per_packet = 160
 
 [tcp_receiver]
 host = "none"
-port = 7998
-header_len = 12
-n_channel = 17
+port = 4000
+header_len = 16
+n_channel = 1
 sample_per_packet = 160

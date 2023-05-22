@@ -119,7 +119,7 @@ impl SocketHandler {
                 }
             };
         }
-        self.socket.shutdown().await.unwrap();
+        self.socket.shutdown().await?; //.unwrap();
         Ok(())
     }
 }
