@@ -15,10 +15,12 @@ use tcp_client::start_tcp_client;
 
 use std::cmp::{max, min};
 use std::sync::Arc;
+// use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 use jack::{RingBufferReader, RingBufferWriter};
 use tokio::{self, sync::Notify};
 use tokio::time::{sleep, Duration};
+use tokio::task::JoinHandle;
 use crossbeam::channel::bounded;
 use arc_swap::ArcSwap;
 
@@ -38,11 +40,13 @@ async fn main() {
     let device_id = cfg.mic.device_id as u16;
 
     let cfg_cp = cfg.clone();
-    let mut jack_server = start_jackd(cfg_cp);
-    sleep(Duration::from_secs(1)).await;
-    let cfg_cp = cfg.clone();
-    let mut alsa_out = start_alsa_out(cfg_cp);
-    sleep(Duration::from_secs(1)).await;
+    let _jack_server = start_jackd(cfg_cp);
+    sleep(Duration::from_millis(1500)).await;
+    if cfg.speaker.use_alsa_out {
+        let cfg_cp = cfg.clone();
+        let _alsa_out = start_alsa_out(cfg_cp);
+        sleep(Duration::from_secs(1)).await;
+    }
  
     let (client, mut n_mic, mut n_speaker) = inspect_device();
     if n_mic < cfg.mic.n_channel {
@@ -196,13 +200,16 @@ async fn main() {
     });
 
     let cfg_cp = cfg.clone();
-    let recv_handler = tokio::spawn(async move {
-        sleep(Duration::from_secs(2)).await;
-        start_tcp_client(
-            cfg_cp,
-            resend,
-            tokio::signal::ctrl_c()).await;
-    });
+    let mut recv_handler_: Option<JoinHandle<()>> = None;
+    if cfg_cp.tcp_receiver.host.to_lowercase() != "none" {
+        recv_handler_ = Some(tokio::spawn(async move {
+            sleep(Duration::from_secs(2)).await;
+            start_tcp_client(
+                cfg_cp,
+                resend,
+                tokio::signal::ctrl_c()).await;
+        }));
+    }
 
     let cfg_cp = cfg.clone();
     start_jack_client(
@@ -215,8 +222,10 @@ async fn main() {
     ).await;
 
     send_handler.await.unwrap();
-    recv_handler.await.unwrap();
-    jack_server.kill().await.expect("Kill jack server failed");
-    alsa_out.kill().await.expect("Kill alsa_out failed");
+    if let Some(recv_handler) = recv_handler_ {
+        recv_handler.await.unwrap();
+    }
+    // jack_server.kill().await.expect("Kill jack server failed");
+    // alsa_out.kill().await.expect("Kill alsa_out failed");
     sleep(Duration::from_secs(1)).await;
 }

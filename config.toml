@@ -1,16 +1,18 @@
 [mic]
 # driver = "coreaudio"
 driver = "alsa"
-device_name = "hw:RASPZX16ch"
+# device_name = "hw:RASPZX16ch"
+device_name = "hw:ArrayUAC10"
 device_id = 0
 sample_rate = 16000
-period = 32
-n_channel = 16
+period = 64
+n_channel = 6
 
 [speaker]
+use_alsa_out = false
 device_name = "plughw:Device"
 sample_rate = 16000
-period = 32
+period = 64
 n_period = 4
 n_channel = 1
 

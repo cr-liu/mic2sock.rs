@@ -220,16 +220,15 @@ fn slice_i16_to_u8_mut(slice: &mut [i16]) -> &mut [u8] {
 #[inline(always)]
 fn pcm_f32_to_i16(s: f32) -> i16 {
     let mut i = (s * 32768.0).round() as i32;
-    if i > 32767 {
-        i = 32767;
-    }
-    if i < -32768 {
-        i = -32768;
-    }
+    if i > 32767 { i = 32767; }
+    if i < -32768 { i = -32768; }
     i as i16
 }
 
 #[inline(always)]
 fn pcm_i16_to_f32(s: i16) -> f32 {
-    s as f32 / 32768.0
+    let mut f = s as f32 / 32768.0;
+    if f > 1.0 { f = 1.0; }
+    if f < -1.0 { f = -1.0; }
+    f
 }

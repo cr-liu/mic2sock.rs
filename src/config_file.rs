@@ -28,6 +28,7 @@ pub struct MicConfig {
 
 #[derive(Serialize, Deserialize)]
 pub struct SpeakerConfig {
+    pub use_alsa_out: bool,
     pub device_name: String,
     pub sample_rate: usize,
     pub period: usize,
@@ -76,6 +77,7 @@ impl Config {
                         n_channel: 16,
                     },
                     speaker: SpeakerConfig { 
+                        use_alsa_out: false,
                         device_name: "plughw:Device".to_string(),
                         sample_rate: 16000,
                         period: 32,
@@ -88,16 +90,16 @@ impl Config {
                         speaker_idx: 0,
                     },
                     tcp_sender: TcpSenderConfig {
-                        listen_port: 2345,
-                        max_clients: 10,
+                        listen_port: 7998,
+                        max_clients: 100,
                         header_len: 12,
                         sample_per_packet: 160,
                     },
                     tcp_receiver: TcpReceiverConfig {
-                        host: "localhost".to_string(),
-                        port: 7998,
-                        header_len: 12,
-                        n_channel: 17,
+                        host: "none".to_string(),
+                        port: 4000,
+                        header_len: 16,
+                        n_channel: 1,
                         sample_per_packet: 160
                     },
                 };
