@@ -26,11 +26,13 @@ pub fn start_jackd(conf: Arc<Config>) -> Child {
 pub fn start_alsa_out(conf: Arc<Config>) -> Child {
     let mut alsa_out = Command::new("alsa_out");
     alsa_out.kill_on_drop(true);
-    alsa_out
-        .arg(format!("-d{}", conf.speaker.device_name))
-        .arg(format!("-r{}", conf.speaker.sample_rate))
-        .arg(format!("-p{}", conf.speaker.period))
-        .arg(format!("-n{}", conf.speaker.n_period));
+    if conf.speaker.use_alsa_out {
+        alsa_out
+            .arg(format!("-d{}", conf.speaker.device_name))
+            .arg(format!("-r{}", conf.speaker.sample_rate))
+            .arg(format!("-p{}", conf.speaker.period))
+            .arg(format!("-n{}", conf.speaker.n_period));
+    }
     alsa_out.spawn().unwrap()
 }
 

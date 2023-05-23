@@ -42,11 +42,9 @@ async fn main() {
     let cfg_cp = cfg.clone();
     let _jack_server = start_jackd(cfg_cp);
     sleep(Duration::from_millis(1500)).await;
-    if cfg.speaker.use_alsa_out {
-        let cfg_cp = cfg.clone();
-        let _alsa_out = start_alsa_out(cfg_cp);
-        sleep(Duration::from_secs(1)).await;
-    }
+    let cfg_cp = cfg.clone();
+    let _alsa_out = start_alsa_out(cfg_cp);
+    sleep(Duration::from_millis(500)).await;
  
     let (client, mut n_mic, mut n_speaker) = inspect_device();
     if n_mic < cfg.mic.n_channel {
