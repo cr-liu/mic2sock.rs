@@ -6,14 +6,13 @@ device_name = "hw:RASPZX16ch"
 device_id = 0
 sample_rate = 16000
 period = 32
-n_channel = 6
+n_period = 4
+n_channel = 16
 
 [speaker]
 use_alsa_out = false
+# device_name = "plughw:Generic_1"
 device_name = "plughw:Device"
-sample_rate = 16000
-period = 32
-n_period = 2
 n_channel = 1
 
 [audio_connection]

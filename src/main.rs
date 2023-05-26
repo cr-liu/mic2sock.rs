@@ -2,7 +2,7 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, Error>;
 
 mod system_call;
-use system_call::{start_jackd, start_alsa_out};
+use system_call::start_jackd;
 mod jack_client;
 use jack_client::{inspect_device, start_jack_client};
 mod config_file;
@@ -12,6 +12,7 @@ use tcp_server::start_server;
 mod ring_buf;
 mod tcp_client;
 use tcp_client::start_tcp_client;
+use tokio::sync::broadcast;
 
 use std::cmp::{max, min};
 use std::sync::Arc;
@@ -22,7 +23,7 @@ use tokio::{self, sync::Notify};
 use tokio::time::{sleep, Duration};
 use tokio::task::JoinHandle;
 use crossbeam::channel::bounded;
-use arc_swap::ArcSwap;
+// use arc_swap::ArcSwap;
 
 
 #[tokio::main]
@@ -42,9 +43,9 @@ async fn main() {
     let cfg_cp = cfg.clone();
     let _jack_server = start_jackd(cfg_cp);
     sleep(Duration::from_millis(1500)).await;
-    let cfg_cp = cfg.clone();
-    let _alsa_out = start_alsa_out(cfg_cp);
-    sleep(Duration::from_millis(500)).await;
+    // let cfg_cp = cfg.clone();
+    // let _alsa_out = start_alsa_out(cfg_cp);
+    // sleep(Duration::from_millis(500)).await;
  
     let (client, mut n_mic, mut n_speaker) = inspect_device();
     if n_mic < cfg.mic.n_channel {
@@ -103,20 +104,25 @@ async fn main() {
     let notify_sound_ready = Arc::new(Notify::new());
     let notifyee_sound_ready = notify_sound_ready.clone();
 
-    let send_packet_buf = Arc::new(
-        ArcSwap::from(Arc::new(vec![0_u8; send_pkt_len])));
-    let sender_buf = send_packet_buf.clone();
-    let mut swap_buf = Arc::new(vec![0_u8; send_pkt_len]);
+    // let send_packet_buf = Arc::new(
+    //     ArcSwap::from(Arc::new(vec![0_u8; send_pkt_len])));
+    // let sender_buf = send_packet_buf.clone();
+    // let mut swap_buf = Arc::new(vec![0_u8; send_pkt_len]);
 
-    let notify_packet_ready = Arc::new(Notify::new());
-    let notifyee_packet_ready = notify_packet_ready.clone();
+    // let notify_packet_ready = Arc::new(Notify::new());
+    // let notifyee_packet_ready = notify_packet_ready.clone();
+
+    let (packet_sender, mut packet_receiver) = broadcast::channel(send_pkt_len * 4);
+    let pkt_sender = packet_sender.clone();
+    let send_packet_buf = vec![0_u8; send_pkt_len];
 
     let _process_sender_buf = tokio::spawn(async move {
         let mut pkt_id = 0_i32;
         loop {
             notifyee_sound_ready.notified().await;
 
-            let swap_buf_mut = Arc::get_mut(&mut swap_buf).unwrap();
+            // let swap_buf_mut = Arc::get_mut(&mut swap_buf).unwrap();
+            let mut swap_buf_mut = send_packet_buf.clone();
 
             let unix_time_in_millis = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -157,8 +163,14 @@ async fn main() {
                 s_idx += send_channel_buf.len();
             }
 
-            swap_buf = sender_buf.swap(swap_buf);
-            notify_packet_ready.notify_waiters();
+            // swap_buf = sender_buf.swap(swap_buf);
+            // notify_packet_ready.notify_waiters();
+            let res = packet_sender.send(swap_buf_mut);
+            if let Err(_) = res {
+                print!("Broadcast packet failed");
+            }
+
+            let _ = packet_receiver.recv();
             
             pkt_id += 1;
             if pkt_id == std::i32::MAX {
@@ -190,8 +202,9 @@ async fn main() {
         start_server(
             listen_port,
             max_clients,
-            send_packet_buf,
-            notifyee_packet_ready,
+            // send_packet_buf,
+            // notifyee_packet_ready,
+            pkt_sender,
             tokio::signal::ctrl_c(),
         )
         .await;

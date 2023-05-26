@@ -23,6 +23,7 @@ pub struct MicConfig {
     pub device_id: usize,
     pub sample_rate: usize,
     pub period: usize,
+    pub n_period: usize,
     pub n_channel: usize,
 }
 
@@ -30,9 +31,6 @@ pub struct MicConfig {
 pub struct SpeakerConfig {
     pub use_alsa_out: bool,
     pub device_name: String,
-    pub sample_rate: usize,
-    pub period: usize,
-    pub n_period: usize,
     pub n_channel: usize,
 }
 
@@ -74,14 +72,12 @@ impl Config {
                         device_id: 0,
                         sample_rate: 16000,
                         period: 32,
+                        n_period: 4,
                         n_channel: 16,
                     },
                     speaker: SpeakerConfig { 
                         use_alsa_out: false,
                         device_name: "plughw:Device".to_string(),
-                        sample_rate: 16000,
-                        period: 32,
-                        n_period: 2,
                         n_channel: 1,
                     },
                     audio_connection: AudioConnection {
