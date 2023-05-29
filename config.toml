@@ -1,4 +1,5 @@
 [mic]
+start_jackd = true
 # driver = "coreaudio"
 driver = "alsa"
 device_name = "hw:RASPZX16ch"

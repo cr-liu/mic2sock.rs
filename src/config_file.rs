@@ -18,6 +18,7 @@ pub struct Config {
 
 #[derive(Serialize, Deserialize)]
 pub struct MicConfig {
+    pub start_jackd: bool,
     pub driver: String,
     pub device_name: String,
     pub device_id: usize,
@@ -67,6 +68,7 @@ impl Config {
                 println!("create new config file conf.toml; please rename it to config.toml");
                 let conf = Config {
                     mic: MicConfig {
+                        start_jackd: true,
                         driver: "alsa".to_string(),
                         device_name: "hw:RASPZX16ch".to_string(),
                         device_id: 0,

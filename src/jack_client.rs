@@ -140,7 +140,7 @@ pub async fn start_jack_client(
     let process_callback = move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
         for (i, port) in in_ports.iter().enumerate() {
             let in_data = port.as_slice(ps);
-            assert_eq!(in_data.len(), period);
+            // assert_eq!(in_data.len(), period);
             for j in 0..period {
                 i16_buf[j] = pcm_f32_to_i16(in_data[j]);
             }
@@ -152,16 +152,23 @@ pub async fn start_jack_client(
             i_sample -= sample_per_packet;
         }
 
+        let mut playback_data_available = true;
         if out_ports.len() == 0 || playback_buf_readers[0].space() < period * 2 { 
-            return jack::Control::Continue; 
+            playback_data_available = false;
         }
         for i in 0..out_ports.len() {
             let out_data_mut= out_ports[i].as_mut_slice(ps);
-            let n_bytes = playback_buf_readers[i].read_buffer(slice_i16_to_u8_mut(i16_buf.as_mut_slice())); 
-            for j in 0..out_data_mut.len() {
-                out_data_mut[j] = pcm_i16_to_f32(i16_buf[j]) * fade_in;
+            if playback_data_available {
+                let _n_bytes = playback_buf_readers[i].read_buffer(slice_i16_to_u8_mut(i16_buf.as_mut_slice())); 
+                // assert_eq!(_n_bytes, period *2);
             }
-            assert_eq!(n_bytes, period *2);
+            for j in 0..out_data_mut.len() {
+                if playback_data_available {
+                    out_data_mut[j] = pcm_i16_to_f32(i16_buf[j]) * fade_in;
+                } else {
+                    out_data_mut[j] = 0.0;
+                }
+            }
         }
         if fade_in < 1.0 {
             fade_in += 0.01;
