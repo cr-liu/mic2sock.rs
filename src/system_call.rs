@@ -6,6 +6,9 @@ use tokio::process::{Child, Command};
 pub fn start_jackd(conf: Arc<Config>) -> Child {
     let mut jack_server = Command::new("jackd");
     jack_server.kill_on_drop(true);
+    if !conf.mic.start_jackd {
+        jack_server.spawn().unwrap()
+    }
     if conf.mic.driver.to_lowercase().contains("coreaudio") {
         jack_server
             .arg("-R")

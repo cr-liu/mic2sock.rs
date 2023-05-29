@@ -40,11 +40,9 @@ async fn main() {
         recv_n_ch * sample_per_recv_packet *2;
     let device_id = cfg.mic.device_id as u16;
 
-    if cfg.mic.start_jackd {
-        let cfg_cp = cfg.clone();
-        let _jack_server = start_jackd(cfg_cp);
-        sleep(Duration::from_millis(1500)).await;
-    }
+    let cfg_cp = cfg.clone();
+    let _jack_server = start_jackd(cfg_cp);
+    sleep(Duration::from_millis(1500)).await;
     // let cfg_cp = cfg.clone();
     // let _alsa_out = start_alsa_out(cfg_cp);
     // sleep(Duration::from_millis(500)).await;
