@@ -40,9 +40,11 @@ async fn main() {
         recv_n_ch * sample_per_recv_packet *2;
     let device_id = cfg.mic.device_id as u16;
 
-    let cfg_cp = cfg.clone();
-    let _jack_server = start_jackd(cfg_cp);
-    sleep(Duration::from_millis(1500)).await;
+    if cfg.mic.start_jackd {
+        let cfg_cp = cfg.clone();
+        let _jack_server = start_jackd(cfg_cp);
+        sleep(Duration::from_millis(1500)).await;
+    }
     // let cfg_cp = cfg.clone();
     // let _alsa_out = start_alsa_out(cfg_cp);
     // sleep(Duration::from_millis(500)).await;
@@ -99,7 +101,7 @@ async fn main() {
         playback_buf_writers.push(writer);
     }
 
-    let (resend, incoming_socket) = bounded::<Vec<u8>>(send_pkt_len * 2);
+    let (resend, incoming_socket) = bounded::<Vec<u8>>(4);
 
     let notify_sound_ready = Arc::new(Notify::new());
     let notifyee_sound_ready = notify_sound_ready.clone();
@@ -112,7 +114,7 @@ async fn main() {
     // let notify_packet_ready = Arc::new(Notify::new());
     // let notifyee_packet_ready = notify_packet_ready.clone();
 
-    let (packet_sender, mut packet_receiver) = broadcast::channel(send_pkt_len * 4);
+    let (packet_sender, mut packet_receiver) = broadcast::channel(16);
     let pkt_sender = packet_sender.clone();
     let send_packet_buf = vec![0_u8; send_pkt_len];
 
