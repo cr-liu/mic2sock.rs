@@ -3,10 +3,11 @@ use crate::Config;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use crossbeam::channel::Sender;
+// use crossbeam::channel::Sender;
+use tokio::sync::mpsc::Sender;
 use tokio::io::AsyncReadExt;
 use tokio::time::{self, Duration};
-use tokio::net::TcpStream ;
+use tokio::net::{self, TcpStream};
 
 
 pub struct TcpClient {
@@ -21,15 +22,19 @@ impl TcpClient {
     pub async fn inf_run(&mut self) -> crate::Result<()> {
         while self.shutdown.load(Ordering::Relaxed) != true {
             let addr = format!("{}:{}", self.host, self.port);
-            match TcpStream::connect(addr).await {
+            match TcpStream::connect(&addr).await {
                 Ok(tcp_stream) => {
                     println!("Connected to {}", self.host);
                     self.inner_loop(tcp_stream,).await;
                     println!("Disconnected from {}", self.host);
                 }
                 Err(_) => {
-                    time::sleep(Duration::from_secs(20)).await;
-                    println!("Try to reconnect");
+                    if let Err(_) = net::lookup_host(&addr).await {
+                        return Ok(());
+                    } else {
+                        time::sleep(Duration::from_secs(2)).await;
+                        println!("Try to reconnect");
+                    }
                 }
             }
         }
@@ -49,7 +54,7 @@ impl TcpClient {
                         continue;
                     }
                     let resend_buf = pkt_buf.clone();
-                    self.resend.send(resend_buf).unwrap();
+                    let _ = self.resend.send(resend_buf).await;
 
                     pkt_buf.clear();
                 }

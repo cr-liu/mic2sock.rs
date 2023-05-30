@@ -12,7 +12,6 @@ use tcp_server::start_server;
 mod ring_buf;
 mod tcp_client;
 use tcp_client::start_tcp_client;
-use tokio::sync::broadcast;
 
 use std::cmp::{max, min};
 use std::sync::Arc;
@@ -21,7 +20,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use jack::{RingBufferReader, RingBufferWriter};
 use tokio::{self, sync::Notify};
 use tokio::time::{sleep, Duration};
-use tokio::task::JoinHandle;
+// use tokio::task::JoinHandle;
+use tokio::sync::{broadcast, mpsc};
 use crossbeam::channel::bounded;
 // use arc_swap::ArcSwap;
 
@@ -99,7 +99,9 @@ async fn main() {
         playback_buf_writers.push(writer);
     }
 
-    let (resend, incoming_socket) = bounded::<Vec<u8>>(4);
+    // let (resend, incoming_socket) = bounded::<Vec<u8>>(4);
+    let (resend, incoming_socket) = mpsc::channel::<Vec<u8>>(4);
+    let (shutdown_s, shutdown_r) = bounded::<()>(0);
 
     let notify_sound_ready = Arc::new(Notify::new());
     let notifyee_sound_ready = notify_sound_ready.clone();
@@ -179,8 +181,74 @@ async fn main() {
         }
     });
 
-    let _process_receiver_buf = tokio::spawn(async move {
-        while let Ok(received_buf) = incoming_socket.recv() {
+    let process_receiver_buf = process_recv_buf(
+        incoming_socket,
+        recv_pkt_len,
+        n_speaker,
+        recv_header_len,
+        sample_per_recv_packet,
+        resend_buf_writers,
+        playback_buf_writers,
+    );
+
+    let (listen_port, max_clients) = (cfg.tcp_sender.listen_port, cfg.tcp_sender.max_clients);
+    let send_handler =
+        start_server(
+            listen_port,
+            max_clients,
+            // send_packet_buf,
+            // notifyee_packet_ready,
+            pkt_sender,
+            tokio::signal::ctrl_c(),
+        );
+
+    let cfg_cp = cfg.clone();
+    let recv_handler =
+        start_tcp_client(
+            cfg_cp,
+            resend,
+            tokio::signal::ctrl_c()
+        );
+
+    let cfg_cp = cfg.clone();
+    let audio_thread = std::thread::spawn(move || {
+        start_jack_client(
+            cfg_cp,
+            client,
+            notify_sound_ready,
+            capture_buf_writers,
+            playback_buf_readers,
+            shutdown_r,
+        );
+    });
+
+    tokio::join!(
+        send_handler,
+        recv_handler,
+        process_receiver_buf,
+    );
+
+    {
+        let _ = tokio::signal::ctrl_c();
+        let _ = shutdown_s.send(());
+    }
+
+    audio_thread.join().unwrap();
+
+    // jack_server.kill().await.expect("Kill jack server failed");
+    // alsa_out.kill().await.expect("Kill alsa_out failed");
+}
+
+pub async fn process_recv_buf(
+    mut incoming_socket: mpsc::Receiver<Vec<u8>>,
+    recv_pkt_len: usize,
+    n_speaker: usize,
+    recv_header_len: usize,
+    sample_per_recv_packet: usize,
+    mut resend_buf_writers: Vec<RingBufferWriter>,
+    mut playback_buf_writers: Vec<RingBufferWriter>,
+) {
+    while let Some(received_buf) = incoming_socket.recv().await {
             assert_eq!(recv_pkt_len, received_buf.len());
             let _secs = u32::from_le_bytes(received_buf[2..6].try_into().unwrap());
             let _ms = i16::from_le_bytes(received_buf[6..8].try_into().unwrap());
@@ -194,49 +262,5 @@ async fn main() {
                 resend_buf_writers[i].write_buffer(&received_buf[s_idx..e_idx]);
                 playback_buf_writers[i].write_buffer(&received_buf[s_idx..e_idx]);
             }
-        }
-    });
-
-    let (listen_port, max_clients) = (cfg.tcp_sender.listen_port, cfg.tcp_sender.max_clients);
-    let send_handler = tokio::spawn(async move {
-        start_server(
-            listen_port,
-            max_clients,
-            // send_packet_buf,
-            // notifyee_packet_ready,
-            pkt_sender,
-            tokio::signal::ctrl_c(),
-        )
-        .await;
-    });
-
-    let cfg_cp = cfg.clone();
-    let mut recv_handler_: Option<JoinHandle<()>> = None;
-    if cfg_cp.tcp_receiver.host.to_lowercase() != "none" {
-        recv_handler_ = Some(tokio::spawn(async move {
-            sleep(Duration::from_secs(2)).await;
-            start_tcp_client(
-                cfg_cp,
-                resend,
-                tokio::signal::ctrl_c()).await;
-        }));
-    }
-
-    let cfg_cp = cfg.clone();
-    start_jack_client(
-        cfg_cp,
-        client,
-        notify_sound_ready,
-        capture_buf_writers,
-        playback_buf_readers,
-        tokio::signal::ctrl_c(),
-    ).await;
-
-    send_handler.await.unwrap();
-    if let Some(recv_handler) = recv_handler_ {
-        recv_handler.await.unwrap();
-    }
-    // jack_server.kill().await.expect("Kill jack server failed");
-    // alsa_out.kill().await.expect("Kill alsa_out failed");
-    sleep(Duration::from_secs(1)).await;
+        }  
 }

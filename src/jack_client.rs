@@ -1,8 +1,8 @@
 use crate::config_file::Config;
 use jack::{RingBufferWriter, RingBufferReader};
-use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::Notify;
+use crossbeam::channel::Receiver;
 
 struct Notifications;
 
@@ -101,13 +101,13 @@ pub fn inspect_device() -> (jack::Client, usize, usize) {
     (client, in_ports_name.len(), out_ports_name.len())
 }
 
-pub async fn start_jack_client(
+pub fn start_jack_client(
     cfg: Arc<Config>,
     client: jack::Client,
     notifier: Arc<Notify>,
     mut buf_writers: Vec<RingBufferWriter>,
     mut playback_buf_readers: Vec<RingBufferReader>,
-    shutdown: impl Future,
+    shutdown: Receiver<()>,
 ) {
     let mut i16_buf = vec![0_i16; cfg.mic.period];
     let period = cfg.mic.period;
@@ -208,7 +208,7 @@ pub async fn start_jack_client(
             .unwrap();
     }
 
-    shutdown.await;
+    let _ = shutdown.recv();
     println!("shutting down jack client");
     active_client.deactivate().unwrap();
 }
