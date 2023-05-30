@@ -140,7 +140,7 @@ pub fn start_jack_client(
     let process_callback = move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
         for (i, port) in in_ports.iter().enumerate() {
             let in_data = port.as_slice(ps);
-            // assert_eq!(in_data.len(), period);
+            assert_eq!(in_data.len(), period);
             for j in 0..period {
                 i16_buf[j] = pcm_f32_to_i16(in_data[j]);
             }
@@ -160,7 +160,7 @@ pub fn start_jack_client(
             let out_data_mut= out_ports[i].as_mut_slice(ps);
             if playback_data_available {
                 let _n_bytes = playback_buf_readers[i].read_buffer(slice_i16_to_u8_mut(i16_buf.as_mut_slice())); 
-                // assert_eq!(_n_bytes, period *2);
+                assert_eq!(_n_bytes, period *2);
             }
             for j in 0..out_data_mut.len() {
                 if playback_data_available {
