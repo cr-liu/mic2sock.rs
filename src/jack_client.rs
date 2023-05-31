@@ -136,7 +136,7 @@ pub fn start_jack_client(
     }
 
     // jack client will call this function each period
-    let mut fade_in = 0.01;
+    let mut _fade_in = 0.01;
     let process_callback = move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
         for (i, port) in in_ports.iter().enumerate() {
             let in_data = port.as_slice(ps);
@@ -164,14 +164,14 @@ pub fn start_jack_client(
             }
             for j in 0..out_data_mut.len() {
                 if playback_data_available {
-                    out_data_mut[j] = pcm_i16_to_f32(i16_buf[j]) * fade_in;
+                    out_data_mut[j] = pcm_i16_to_f32(i16_buf[j]);// * fade_in;
                 } else {
                     out_data_mut[j] = 0.0;
                 }
             }
         }
-        if fade_in < 1.0 {
-            fade_in += 0.01;
+        if _fade_in < 1.0 {
+            _fade_in += 0.01;
         }
 
         jack::Control::Continue

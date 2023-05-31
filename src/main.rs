@@ -21,7 +21,7 @@ use jack::{RingBufferReader, RingBufferWriter};
 use tokio::{self, sync::Notify};
 use tokio::time::{sleep, Duration};
 // use tokio::task::JoinHandle;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc};
 use crossbeam::channel::bounded;
 // use arc_swap::ArcSwap;
 
@@ -100,7 +100,6 @@ async fn main() {
     // let (resend, incoming_socket) = bounded::<Vec<u8>>(4);
     let (resend, incoming_socket) = mpsc::channel::<Vec<u8>>(4);
     let (shutdown_sync_s, shutdown_sync_r) = bounded::<()>(0);
-    let (shutdown_async_s, shutdown_async_r) = oneshot::channel::<()>();
 
     let notify_sound_ready = Arc::new(Notify::new());
     let notifyee_sound_ready = notify_sound_ready.clone();
@@ -128,7 +127,6 @@ async fn main() {
         resend_buf_readers,
         packet_sender,
         packet_receiver,
-        shutdown_async_r,
     );
 
     let process_receiver_buf = process_recv_buf(
@@ -182,7 +180,7 @@ async fn main() {
     {
         let _ = tokio::signal::ctrl_c();
         let _ = shutdown_sync_s.send(());
-        drop(shutdown_async_s);
+        println!("sent shutdown signal");
     }
 
     audio_thread.join().unwrap();
@@ -213,11 +211,13 @@ pub async fn process_recv_buf(
 
             resend_buf_writers[i].write_buffer(&received_buf[s_idx..e_idx]);
             let n = playback_buf_writers[i].write_buffer(&received_buf[s_idx..e_idx]);
+            assert_eq!(n, recv_pkt_len - recv_header_len);
             if n < recv_pkt_len - recv_header_len {
                 println!("Playback ringbuffer overflow");
             }
         }
-    }  
+    }
+    println!("Break recv loop");
 }
 
 pub async fn process_send_buf(
@@ -232,74 +232,76 @@ pub async fn process_send_buf(
     mut resend_buf_readers: Vec<RingBufferReader>,
     packet_sender: broadcast::Sender<Vec<u8>>,
     mut packet_receiver: broadcast::Receiver<Vec<u8>>,
-    mut shutdown_async_r: oneshot::Receiver<()>,
 ) {
-    let mut pkt_id = 0_i32;
-    let send_packet_buf = vec![0_u8; send_pkt_len];
-    let mut send_channel_buf = vec![0_u8; sample_per_send_packet * 2];
-    let zeroed_channel_buf = vec![0_u8; sample_per_send_packet *2];
-        loop {
-            notifyee_sound_ready.notified().await;
+    tokio::select! {
+        _ = async {
+            let mut pkt_id = 0_i32;
+            let send_packet_buf = vec![0_u8; send_pkt_len];
+            let mut send_channel_buf = vec![0_u8; sample_per_send_packet * 2];
+            let zeroed_channel_buf = vec![0_u8; sample_per_send_packet *2];
+            loop {
+                notifyee_sound_ready.notified().await;
 
-            // let swap_buf_mut = Arc::get_mut(&mut swap_buf).unwrap();
-            let mut swap_buf_mut = send_packet_buf.clone();
+                // let swap_buf_mut = Arc::get_mut(&mut swap_buf).unwrap();
+                let mut swap_buf_mut = send_packet_buf.clone();
 
-            let unix_time_in_millis = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-                - 10;
-            let device_id = device_id;
-            let mut secs = (unix_time_in_millis / 1000) as u32;
-            let mut ms = (unix_time_in_millis % 1000) as i16 - packet_time_len;
-            if ms < 0 {
-                secs -= 1;
-                ms = ms + 1000;
-            }
-
-            swap_buf_mut[0..2].copy_from_slice(&device_id.to_le_bytes());
-            swap_buf_mut[2..6].copy_from_slice(&secs.to_le_bytes());
-            swap_buf_mut[6..8].copy_from_slice(&ms.to_le_bytes());
-            swap_buf_mut[8..12].copy_from_slice(&pkt_id.to_le_bytes());
-            
-            let mut s_idx = send_header_len;
-            for i in 0..capture_buf_readers.len() {
-                let n_bytes = capture_buf_readers[i].read_buffer(send_channel_buf.as_mut_slice());
-                assert_eq!(n_bytes, send_channel_buf.len());
-                let e_idx = s_idx + send_channel_buf.len();
-
-                swap_buf_mut[s_idx..e_idx].copy_from_slice(send_channel_buf.as_ref());
-                s_idx += send_channel_buf.len();
-            }
-
-            for i in 0..n_speaker {
-                let e_idx = s_idx + send_channel_buf.len();
-                if resend_buf_readers[0].space() < sample_per_send_packet * 2 {
-                    swap_buf_mut[s_idx..e_idx].copy_from_slice(zeroed_channel_buf.as_ref());
-                } else {
-                    let n_bytes = resend_buf_readers[i].read_buffer(send_channel_buf.as_mut());
-                    assert_eq!(n_bytes, send_channel_buf.len());
-                    swap_buf_mut[s_idx..e_idx].copy_from_slice(send_channel_buf.as_ref());
+                let unix_time_in_millis = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+                    - 10;
+                let device_id = device_id;
+                let mut secs = (unix_time_in_millis / 1000) as u32;
+                let mut ms = (unix_time_in_millis % 1000) as i16 - packet_time_len;
+                if ms < 0 {
+                    secs -= 1;
+                    ms = ms + 1000;
                 }
-                s_idx += send_channel_buf.len();
-            }
 
-            // swap_buf = sender_buf.swap(swap_buf);
-            // notify_packet_ready.notify_waiters();
-            let res = packet_sender.send(swap_buf_mut);
-            if let Err(_) = res {
-                print!("Broadcast packet failed");
-            }
+                swap_buf_mut[0..2].copy_from_slice(&device_id.to_le_bytes());
+                swap_buf_mut[2..6].copy_from_slice(&secs.to_le_bytes());
+                swap_buf_mut[6..8].copy_from_slice(&ms.to_le_bytes());
+                swap_buf_mut[8..12].copy_from_slice(&pkt_id.to_le_bytes());
+        
+                let mut s_idx = send_header_len;
+                for i in 0..capture_buf_readers.len() {
+                    let n_bytes = capture_buf_readers[i].read_buffer(send_channel_buf.as_mut_slice());
+                    assert_eq!(n_bytes, send_channel_buf.len());
+                    let e_idx = s_idx + send_channel_buf.len();
 
-            let _ = packet_receiver.recv();
-            
-            pkt_id += 1;
-            if pkt_id == std::i32::MAX {
-                pkt_id = 0;
-            }
+                    swap_buf_mut[s_idx..e_idx].copy_from_slice(send_channel_buf.as_ref());
+                    s_idx += send_channel_buf.len();
+                }
 
-            if let Err(_) = shutdown_async_r.try_recv() {
-                break;
+                for i in 0..n_speaker {
+                    let e_idx = s_idx + send_channel_buf.len();
+                    if resend_buf_readers[0].space() < sample_per_send_packet * 2 {
+                        swap_buf_mut[s_idx..e_idx].copy_from_slice(zeroed_channel_buf.as_ref());
+                    } else {
+                        let n_bytes = resend_buf_readers[i].read_buffer(send_channel_buf.as_mut());
+                        assert_eq!(n_bytes, send_channel_buf.len());
+                        swap_buf_mut[s_idx..e_idx].copy_from_slice(send_channel_buf.as_ref());
+                    }
+                    s_idx += send_channel_buf.len();
+                }
+
+                // swap_buf = sender_buf.swap(swap_buf);
+                // notify_packet_ready.notify_waiters();
+                let res = packet_sender.send(swap_buf_mut);
+                if let Err(_) = res {
+                    print!("Broadcast packet failed");
+                }
+
+                let _ = packet_receiver.recv();
+        
+                pkt_id += 1;
+                if pkt_id == std::i32::MAX {
+                    pkt_id = 0;
+                }
             }
+        } => {}
+        _ = tokio::signal::ctrl_c() => {
+            println!("Break send loop");
         }
+    }
 }
