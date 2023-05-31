@@ -80,8 +80,7 @@ async fn main() {
     let mut resend_buf_readers = Vec::<RingBufferReader>::new();
     let mut resend_buf_writers = Vec::<RingBufferWriter>::new();
     for _ in 0..n_speaker {
-        // reserve 0.5s buffer for each mic
-        let ringbuf = jack::RingBuffer::new(sample_per_packet * 4).unwrap();
+        let ringbuf = jack::RingBuffer::new(sample_per_packet * 8).unwrap();
         let (reader, writer) = ringbuf.into_reader_writer();
         resend_buf_readers.push(reader);
         resend_buf_writers.push(writer);
@@ -91,8 +90,7 @@ async fn main() {
     let mut playback_buf_readers = Vec::<RingBufferReader>::new();
     let mut playback_buf_writers = Vec::<RingBufferWriter>::new();
     for _ in 0..n_speaker {
-        // reserve 0.5s buffer for each mic
-        let ringbuf = jack::RingBuffer::new(cfg.mic.sample_rate).unwrap();
+        let ringbuf = jack::RingBuffer::new(sample_per_packet * 8).unwrap();
         let (reader, writer) = ringbuf.into_reader_writer();
         playback_buf_readers.push(reader);
         playback_buf_writers.push(writer);
@@ -201,6 +199,10 @@ pub async fn process_recv_buf(
 ) {
     while let Some(received_buf) = incoming_socket.recv().await {
         assert_eq!(recv_pkt_len, received_buf.len());
+        if playback_buf_writers.len() ==0 ||
+        playback_buf_writers[0].space() < sample_per_recv_packet * 4 {
+            continue;
+        }
         let _secs = u32::from_le_bytes(received_buf[2..6].try_into().unwrap());
         let _ms = i16::from_le_bytes(received_buf[6..8].try_into().unwrap());
         let _pkt_id = i32::from_le_bytes(received_buf[8..12].try_into().unwrap());
