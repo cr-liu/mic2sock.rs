@@ -53,6 +53,7 @@ impl TcpClient {
                     if pkt_buf.len() < self.pkt_size {
                         continue;
                     }
+                    assert_eq!(pkt_buf.len(), self.pkt_size);
                     let resend_buf = pkt_buf.clone();
                     let _ = self.resend.send(resend_buf).await;
 

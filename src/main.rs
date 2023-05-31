@@ -14,6 +14,7 @@ mod tcp_client;
 use tcp_client::start_tcp_client;
 
 use std::cmp::{max, min};
+use std::io::Write;
 use std::sync::Arc;
 // use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -209,12 +210,8 @@ pub async fn process_recv_buf(
             let s_idx = recv_header_len + sample_per_recv_packet * 2 * i;
             let e_idx = s_idx + sample_per_recv_packet * 2;
 
-            resend_buf_writers[i].write_buffer(&received_buf[s_idx..e_idx]);
-            let n = playback_buf_writers[i].write_buffer(&received_buf[s_idx..e_idx]);
-            assert_eq!(n, recv_pkt_len - recv_header_len);
-            if n < recv_pkt_len - recv_header_len {
-                println!("Playback ringbuffer overflow");
-            }
+            resend_buf_writers[i].write_all(&received_buf[s_idx..e_idx]).unwrap();
+            playback_buf_writers[i].write_all(&received_buf[s_idx..e_idx]).unwrap();
         }
     }
     println!("Break recv loop");

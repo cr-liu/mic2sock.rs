@@ -1,6 +1,6 @@
 use crate::config_file::Config;
+use std::{sync::Arc, io::Write};
 use jack::{RingBufferWriter, RingBufferReader};
-use std::sync::Arc;
 use tokio::sync::Notify;
 use crossbeam::channel::Receiver;
 
@@ -144,7 +144,7 @@ pub fn start_jack_client(
             for j in 0..period {
                 i16_buf[j] = pcm_f32_to_i16(in_data[j]);
             }
-            buf_writers[i].write_buffer(slice_i16_to_u8(i16_buf.as_slice()));
+            buf_writers[i].write_all(slice_i16_to_u8(i16_buf.as_slice())).unwrap();
         }
         i_sample += period;
         if i_sample >= sample_per_packet {
