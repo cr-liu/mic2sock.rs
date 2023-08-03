@@ -82,7 +82,7 @@ async fn main() {
     let mut resend_buf_writers = Vec::<RingBufferWriter>::new();
     for _ in 0..n_speaker {
         // let ringbuf = jack::RingBuffer::new(sample_per_packet * 8).unwrap();
-        let ringbuf = jack::RingBuffer::new(sample_rate * 4).unwrap(); // 2 sec buffer
+        let ringbuf = jack::RingBuffer::new(sample_rate * 240).unwrap(); // 2 min buffer
         let (reader, writer) = ringbuf.into_reader_writer();
         resend_buf_readers.push(reader);
         resend_buf_writers.push(writer);
@@ -93,7 +93,7 @@ async fn main() {
     let mut playback_buf_writers = Vec::<RingBufferWriter>::new();
     for _ in 0..n_speaker {
         // let ringbuf = jack::RingBuffer::new(sample_per_packet * 8).unwrap();
-        let ringbuf = jack::RingBuffer::new(sample_rate * 4).unwrap(); // 2 sec buffer
+        let ringbuf = jack::RingBuffer::new(sample_rate * 240).unwrap(); // 2 min buffer
         let (reader, writer) = ringbuf.into_reader_writer();
         playback_buf_readers.push(reader);
         playback_buf_writers.push(writer);
