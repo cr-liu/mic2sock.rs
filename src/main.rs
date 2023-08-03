@@ -35,7 +35,8 @@ async fn main() {
     let sample_per_send_packet = cfg.tcp_sender.sample_per_packet;
     let sample_per_recv_packet = cfg.tcp_receiver.sample_per_packet;
     let sample_per_packet = max(sample_per_send_packet, sample_per_recv_packet);
-    let packet_time_len = (sample_per_send_packet * 1000 / cfg.mic.sample_rate) as i16;
+    let sample_rate = cfg.mic.sample_rate;
+    let packet_time_len = (sample_per_send_packet * 1000 / sample_rate) as i16;
     let recv_n_ch = cfg.tcp_receiver.n_channel;
     let recv_pkt_len = recv_header_len + 
         recv_n_ch * sample_per_recv_packet *2;
@@ -80,7 +81,8 @@ async fn main() {
     let mut resend_buf_readers = Vec::<RingBufferReader>::new();
     let mut resend_buf_writers = Vec::<RingBufferWriter>::new();
     for _ in 0..n_speaker {
-        let ringbuf = jack::RingBuffer::new(sample_per_packet * 8).unwrap();
+        // let ringbuf = jack::RingBuffer::new(sample_per_packet * 8).unwrap();
+        let ringbuf = jack::RingBuffer::new(sample_rate * 4).unwrap(); // 2 sec buffer
         let (reader, writer) = ringbuf.into_reader_writer();
         resend_buf_readers.push(reader);
         resend_buf_writers.push(writer);
@@ -90,7 +92,8 @@ async fn main() {
     let mut playback_buf_readers = Vec::<RingBufferReader>::new();
     let mut playback_buf_writers = Vec::<RingBufferWriter>::new();
     for _ in 0..n_speaker {
-        let ringbuf = jack::RingBuffer::new(sample_per_packet * 8).unwrap();
+        // let ringbuf = jack::RingBuffer::new(sample_per_packet * 8).unwrap();
+        let ringbuf = jack::RingBuffer::new(sample_rate * 4).unwrap(); // 2 sec buffer
         let (reader, writer) = ringbuf.into_reader_writer();
         playback_buf_readers.push(reader);
         playback_buf_writers.push(writer);
