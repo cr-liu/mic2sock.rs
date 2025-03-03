@@ -15,6 +15,7 @@ use tcp_client::start_tcp_client;
 
 use std::cmp::{max, min};
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 // use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -158,6 +159,8 @@ async fn main() {
         );
 
     let cfg_cp = cfg.clone();
+    let jack_panic_flag = Arc::new(AtomicBool::new(false));
+    let jack_panic_flag_clone = jack_panic_flag.clone();
     let audio_thread = std::thread::spawn(move || {
         start_jack_client(
             cfg_cp,
@@ -166,7 +169,21 @@ async fn main() {
             capture_buf_writers,
             playback_buf_readers,
             shutdown_sync_r,
+            jack_panic_flag_clone
         );
+    });
+
+    let shutdown_sender = shutdown_sync_s.clone();
+
+    tokio::spawn(async move {
+        loop {
+            if jack_panic_flag.load(Ordering::SeqCst) {
+                eprintln!("Critical JACK failure detected");
+                let _ = shutdown_sender.send(());
+                panic!("JACK subsystem failure");
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
     });
 
     tokio::join!(

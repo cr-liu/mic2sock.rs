@@ -3,8 +3,11 @@ use std::{sync::Arc, io::Write};
 use jack::{RingBufferWriter, RingBufferReader};
 use tokio::sync::Notify;
 use crossbeam::channel::Receiver;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-struct Notifications;
+struct Notifications {
+    panic_trigger: Arc<AtomicBool>,
+}
 
 impl jack::NotificationHandler for Notifications {
     fn thread_init(&self, _: &jack::Client) {
@@ -12,10 +15,8 @@ impl jack::NotificationHandler for Notifications {
     }
 
     fn shutdown(&mut self, status: jack::ClientStatus, reason: &str) {
-        println!(
-            "JACK: shutdown with status {:?} because \"{}\"",
-            status, reason
-        );
+        eprintln!("JACK FATAL: {:?} - {}", status, reason);
+        self.panic_trigger.store(true, Ordering::SeqCst);
     }
 
     fn freewheel(&mut self, _: &jack::Client, is_enabled: bool) {
@@ -108,6 +109,7 @@ pub fn start_jack_client(
     mut buf_writers: Vec<RingBufferWriter>,
     mut playback_buf_readers: Vec<RingBufferReader>,
     shutdown: Receiver<()>,
+    panic_trigger: Arc<AtomicBool>,
 ) {
     let mut i16_buf = vec![0_i16; cfg.mic.period];
     let period = cfg.mic.period;
@@ -134,6 +136,19 @@ pub fn start_jack_client(
         );
         
     }
+
+    let notifications = Notifications {
+        panic_trigger: panic_trigger.clone(),
+    };
+    
+    struct CleanupGuard;
+    impl Drop for CleanupGuard {
+        fn drop(&mut self) {
+            println!("JACK: Performing emergency cleanup...");
+            // Add any JACK-specific cleanup here
+        }
+    }
+    let _guard = CleanupGuard;
 
     // jack client will call this function each period
     let mut _fade_in = 0.01;
@@ -179,7 +194,7 @@ pub fn start_jack_client(
 
     let process = jack::ClosureProcessHandler::new(process_callback);
     let active_client = 
-        client.activate_async(Notifications, process).unwrap();
+        client.activate_async(notifications, process).unwrap();
 
     for i in 0..cfg.mic.n_channel {
         active_client
