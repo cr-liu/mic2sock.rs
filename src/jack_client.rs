@@ -127,6 +127,15 @@ pub fn start_jack_client(
                 .unwrap()
         );
     }
+    if cfg.mic_2nd.use_optional_mic {
+        for i in 0..cfg.mic_2nd.n_channel {
+            in_ports.push(
+                client
+                    .register_port(format!("in_{i}").as_str(), jack::AudioIn::default())
+                    .unwrap()
+            );
+        }
+    }
     let mut out_ports = Vec::<jack::Port<jack::AudioOut>>::new();
     for i in 0..cfg.speaker.n_channel {
         out_ports.push(
@@ -201,6 +210,18 @@ pub fn start_jack_client(
             .as_client()
             .connect_ports_by_name(&in_ports_name[i], format!("rust_client:in_{i}").as_str())
             .unwrap();
+    }
+
+    if cfg.mic_2nd.use_optional_mic {
+        let alsa_in_jack_client_name = &cfg.mic_2nd.device_name;
+        for i in 0..cfg.mic_2nd.n_channel {
+            let alsa_in_source_port_name = format!("{}:capture_{}", alsa_in_jack_client_name, i);
+            let port_idx = i + cfg.mic.n_channel;
+            active_client
+                .as_client()
+                .connect_ports_by_name(&alsa_in_source_port_name, format!("rust_client:in_{port_idx}").as_str())
+                .unwrap();
+        }
     }
 
     for i in 0..cfg.speaker.n_channel {

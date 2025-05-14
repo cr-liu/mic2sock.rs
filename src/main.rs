@@ -2,7 +2,7 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 type Result<T> = std::result::Result<T, Error>;
 
 mod system_call;
-use system_call::start_jackd;
+use system_call::{start_jackd, start_alsa_in};
 mod jack_client;
 use jack_client::{inspect_device, start_jack_client};
 mod config_file;
@@ -45,6 +45,11 @@ async fn main() {
     let cfg_cp = cfg.clone();
     let _jack_server = start_jackd(cfg_cp);
     sleep(Duration::from_millis(1500)).await;
+    if cfg.mic_2nd.use_optional_mic {
+        let cfg_cp = cfg.clone();
+        let _alsa_in = start_alsa_in(cfg_cp);
+        sleep(Duration::from_millis(500)).await;
+    }
     // let cfg_cp = cfg.clone();
     // let _alsa_out = start_alsa_out(cfg_cp);
     // sleep(Duration::from_millis(500)).await;
@@ -52,18 +57,21 @@ async fn main() {
     let (client, mut n_mic, mut n_speaker) = inspect_device();
     if n_mic < cfg.mic.n_channel {
         println!("n_mic set to {}", n_mic);
-        if let Some(mut cfg_mut) = Arc::<Config>::get_mut(&mut cfg) {
+        if let Some(cfg_mut) = Arc::<Config>::get_mut(&mut cfg) {
             cfg_mut.mic.n_channel = n_mic;
         }
     }
     n_speaker = min(n_speaker, cfg.tcp_receiver.n_channel);
     if n_speaker < cfg.speaker.n_channel {
         println!("n_speaker set to {}", n_speaker);
-        if let Some(mut cfg_mut) = Arc::<Config>::get_mut(&mut cfg) {
+        if let Some(cfg_mut) = Arc::<Config>::get_mut(&mut cfg) {
             cfg_mut.speaker.n_channel = n_speaker;
         }
     }
     (n_mic, n_speaker) = (cfg.mic.n_channel, cfg.speaker.n_channel);
+    if cfg.mic_2nd.use_optional_mic {
+        n_mic += cfg.mic_2nd.n_channel;
+    }
     let n_ch = n_mic + n_speaker;
     let send_pkt_len = send_header_len + sample_per_send_packet * n_ch * 2;
     println!("Send {n_ch} channels with packet length {send_pkt_len}");

@@ -6,9 +6,15 @@ device_name = "hw:RASPZX16ch"
 # device_name = "hw:ArrayUAC10"
 device_id = 0
 sample_rate = 16000
-period = 32
-n_period = 4
+period = 64
+n_period = 3
 n_channel = 16
+
+[mic_2nd]
+jack_client = "alsa_in"
+# jack_client = "zita-a2j"
+device_name = "hw:Device_3"
+n_channel = 1
 
 [speaker]
 use_alsa_out = false

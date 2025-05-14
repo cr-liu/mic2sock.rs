@@ -10,6 +10,7 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 #[derive(Serialize, Deserialize)]
 pub struct Config {
     pub mic: MicConfig,
+    pub mic_2nd: OptionalMicConfig,
     pub speaker: SpeakerConfig,
     pub audio_connection: AudioConnection,
     pub tcp_sender: TcpSenderConfig,
@@ -25,6 +26,13 @@ pub struct MicConfig {
     pub sample_rate: usize,
     pub period: usize,
     pub n_period: usize,
+    pub n_channel: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct OptionalMicConfig {
+    pub use_optional_mic: bool,
+    pub device_name: String,
     pub n_channel: usize,
 }
 
@@ -73,9 +81,14 @@ impl Config {
                         device_name: "hw:RASPZX16ch".to_string(),
                         device_id: 0,
                         sample_rate: 16000,
-                        period: 32,
-                        n_period: 4,
+                        period: 64,
+                        n_period: 3,
                         n_channel: 16,
+                    },
+                    mic_2nd: OptionalMicConfig {
+                        use_optional_mic: false,
+                        device_name: "hw:Device_3".to_string(),
+                        n_channel: 1,
                     },
                     speaker: SpeakerConfig { 
                         use_alsa_out: false,
