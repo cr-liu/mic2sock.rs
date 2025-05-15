@@ -1,9 +1,7 @@
 [mic]
 start_jackd = true
-# driver = "coreaudio"
 driver = "alsa"
 device_name = "hw:RASPZX16ch"
-# device_name = "hw:ArrayUAC10"
 device_id = 0
 sample_rate = 16000
 period = 64
@@ -11,20 +9,16 @@ n_period = 3
 n_channel = 16
 
 [mic_2nd]
-use_optional_mic = true
-jack_client = "alsa_in"
-# jack_client = "zita-a2j"
+use_optional_mic = false
 device_name = "hw:Device_3"
 n_channel = 1
 
 [speaker]
 use_alsa_out = false
-# device_name = "plughw:Generic_1"
 device_name = "plughw:Device"
-n_channel = 0
+n_channel = 1
 
 [audio_connection]
-# connect_mic_speaker = true
 connect_mic_speaker = false
 mic_idx = 0
 speaker_idx = 0
