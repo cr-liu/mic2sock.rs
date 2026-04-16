@@ -1,62 +1,53 @@
 use serde::{Deserialize, Serialize};
-use std::{
-    fs,
-    io::Write,
-};
-use toml;
+use std::{fs, io::Write};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
-#[derive(Serialize, Deserialize)]
+pub const HEADER_LEN: usize = 12;
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
-    pub mic: MicConfig,
-    pub speaker: SpeakerConfig,
-    pub audio_connection: AudioConnection,
-    pub tcp_sender: TcpSenderConfig,
-    pub tcp_receiver: TcpReceiverConfig,
+    pub general: GeneralConfig,
+    pub capture_device: Vec<CaptureDeviceConfig>,
+    pub playback: PlaybackConfig,
+    pub sender: SenderConfig,
+    pub receiver: ReceiverConfig,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct MicConfig {
-    pub start_jackd: bool,
-    pub driver: String,
-    pub device_name: String,
-    pub device_id: usize,
+#[derive(Serialize, Deserialize, Clone)]
+pub struct GeneralConfig {
     pub sample_rate: usize,
     pub period: usize,
     pub n_period: usize,
-    pub n_channel: usize,
+    pub sample_per_packet: usize,
+    pub device_id: usize,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct SpeakerConfig {
-    pub use_alsa_out: bool,
+#[derive(Serialize, Deserialize, Clone)]
+pub struct CaptureDeviceConfig {
     pub device_name: String,
     pub n_channel: usize,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct AudioConnection {
-    pub connect_mic_speaker: bool,
-    pub mic_idx: usize,
-    pub speaker_idx: usize,
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PlaybackConfig {
+    pub device_name: String,
+    pub n_channel: usize,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct TcpSenderConfig {
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SenderConfig {
+    pub protocol: String,
     pub listen_port: usize,
     pub max_clients: usize,
-    pub header_len: usize,
-    pub sample_per_packet: usize,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct TcpReceiverConfig {
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ReceiverConfig {
+    pub protocol: String,
     pub host: String,
     pub port: usize,
-    pub header_len: usize,
     pub n_channel: usize,
-    pub sample_per_packet: usize,
 }
 
 impl Config {
@@ -65,49 +56,16 @@ impl Config {
             Ok(conf) => conf,
             Err(err) => {
                 println!("failed reading config.toml! {}", err);
-                println!("create new config file conf.toml; please rename it to config.toml");
-                let conf = Config {
-                    mic: MicConfig {
-                        start_jackd: true,
-                        driver: "alsa".to_string(),
-                        device_name: "hw:RASPZX16ch".to_string(),
-                        device_id: 0,
-                        sample_rate: 16000,
-                        period: 32,
-                        n_period: 4,
-                        n_channel: 16,
-                    },
-                    speaker: SpeakerConfig { 
-                        use_alsa_out: false,
-                        device_name: "plughw:Device".to_string(),
-                        n_channel: 1,
-                    },
-                    audio_connection: AudioConnection {
-                        connect_mic_speaker: false,
-                        mic_idx: 0,
-                        speaker_idx: 0,
-                    },
-                    tcp_sender: TcpSenderConfig {
-                        listen_port: 7998,
-                        max_clients: 100,
-                        header_len: 12,
-                        sample_per_packet: 160,
-                    },
-                    tcp_receiver: TcpReceiverConfig {
-                        host: "none".to_string(),
-                        port: 4000,
-                        header_len: 16,
-                        n_channel: 1,
-                        sample_per_packet: 160
-                    },
-                };
-                let toml = toml::to_string(&conf).unwrap();
+                println!("creating default conf.toml; please rename it to config.toml");
+                let conf = Config::default();
+                let toml_str = toml::to_string(&conf).unwrap();
                 let mut f = fs::OpenOptions::new()
                     .write(true)
                     .create(true)
+                    .truncate(true)
                     .open("conf.toml")
                     .unwrap();
-                f.write_all(toml.as_bytes()).unwrap();
+                f.write_all(toml_str.as_bytes()).unwrap();
                 conf
             }
         }
@@ -117,5 +75,40 @@ impl Config {
         let contents = fs::read_to_string("config.toml")?;
         let conf: Config = toml::from_str(&contents)?;
         Ok(conf)
+    }
+
+    pub fn total_capture_channels(&self) -> usize {
+        self.capture_device.iter().map(|d| d.n_channel).sum()
+    }
+
+    fn default() -> Config {
+        Config {
+            general: GeneralConfig {
+                sample_rate: 16000,
+                period: 32,
+                n_period: 3,
+                sample_per_packet: 32,
+                device_id: 0,
+            },
+            capture_device: vec![CaptureDeviceConfig {
+                device_name: "hw:RASPZX16ch".to_string(),
+                n_channel: 16,
+            }],
+            playback: PlaybackConfig {
+                device_name: "plughw:Device".to_string(),
+                n_channel: 1,
+            },
+            sender: SenderConfig {
+                protocol: "udp".to_string(),
+                listen_port: 7998,
+                max_clients: 100,
+            },
+            receiver: ReceiverConfig {
+                protocol: "udp".to_string(),
+                host: "none".to_string(),
+                port: 4000,
+                n_channel: 1,
+            },
+        }
     }
 }
