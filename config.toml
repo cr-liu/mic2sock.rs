@@ -23,3 +23,8 @@ protocol = "udp"
 host = "none"
 port = 4000
 n_channel = 1
+# pkt_len: optional, override the received packet size.
+# If omitted, computed as: HEADER(12) + n_channel * sample_per_packet * 2
+# Set this when receiving from a sender with a different total channel count.
+# e.g. sender with 18ch, sample_per_packet=32: 12 + 18 * 32 * 2 = 1164
+# pkt_len = 1164
