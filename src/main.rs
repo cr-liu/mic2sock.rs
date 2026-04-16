@@ -1,3 +1,4 @@
+mod alsa_capture;
 mod config_file;
 use config_file::Config;
 
