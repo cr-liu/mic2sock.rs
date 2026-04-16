@@ -122,24 +122,24 @@ async fn main() {
                 let pkt_id = i32::from_le_bytes(pkt[8..12].try_into().unwrap());
 
                 if let Some(last) = last_pkt_id {
-                    if pkt_id != last.wrapping_add(1) && pkt_id > last {
-                        // Gap detected — silence is automatic (we just don't write)
-                    } else if pkt_id <= last && pkt_id != 0 {
-                        // Out of order — drop
+                    let diff = pkt_id.wrapping_sub(last);
+                    if diff == 0 {
+                        continue; // duplicate
+                    } else if diff <= 0 || diff > 1000 {
+                        // Out of order or too far behind — drop
                         continue;
                     }
+                    // diff in 1..=1000: normal forward progression (with possible gap)
                 }
                 last_pkt_id = Some(pkt_id);
 
                 let audio_data = &pkt[HEADER_LEN..];
-                let samples: &[i16] = unsafe {
-                    std::slice::from_raw_parts(
-                        audio_data.as_ptr() as *const i16,
-                        audio_data.len() / 2,
-                    )
-                };
+                let samples: Vec<i16> = audio_data
+                    .chunks_exact(2)
+                    .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                    .collect();
                 use ringbuf::traits::Producer;
-                pb_producer.push_slice(samples);
+                pb_producer.push_slice(&samples);
             }
         });
 

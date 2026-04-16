@@ -61,11 +61,13 @@ pub async fn start_udp_server(
                 Err(_) => break,
             };
 
-            let mut map = send_clients.lock().await;
-            let now = Instant::now();
-            map.retain(|_, last_seen| now.duration_since(*last_seen) < Duration::from_secs(5));
-
-            for addr in map.keys() {
+            let addrs: Vec<SocketAddr> = {
+                let mut map = send_clients.lock().await;
+                let now = Instant::now();
+                map.retain(|_, last_seen| now.duration_since(*last_seen) < Duration::from_secs(5));
+                map.keys().cloned().collect()
+            };
+            for addr in &addrs {
                 let _ = send_socket.send_to(&packet, addr).await;
             }
         }
