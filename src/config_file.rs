@@ -48,6 +48,7 @@ pub struct ReceiverConfig {
     pub host: String,
     pub port: usize,
     pub n_channel: usize,
+    pub pkt_len: Option<usize>,
 }
 
 impl Config {
@@ -108,6 +109,7 @@ impl Config {
                 host: "none".to_string(),
                 port: 4000,
                 n_channel: 1,
+                pkt_len: None,
             },
         }
     }

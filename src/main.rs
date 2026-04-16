@@ -31,7 +31,8 @@ async fn main() {
     let pkt_payload_size = total_capture_ch * sample_per_packet * 2;
     let send_pkt_len = HEADER_LEN + pkt_payload_size;
 
-    let recv_pkt_len = HEADER_LEN + cfg.receiver.n_channel * sample_per_packet * 2;
+    let recv_pkt_len = cfg.receiver.pkt_len
+        .unwrap_or(HEADER_LEN + cfg.receiver.n_channel * sample_per_packet * 2);
 
     println!(
         "Capture: {} devices, {} total channels, packet size {}",
