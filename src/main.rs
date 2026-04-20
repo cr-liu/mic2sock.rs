@@ -50,7 +50,6 @@ async fn main() {
 
     let (wave_tap_tx, _) = tokio::sync::broadcast::channel::<Vec<i16>>(4);
     let wave_tap_for_gui = wave_tap_tx.clone();
-    let _ = wave_tap_for_gui;
 
     let mut secondary_consumers = Vec::new();
     let mut capture_threads = Vec::new();
@@ -112,7 +111,6 @@ async fn main() {
         static_receivers_parsed.iter().copied().collect::<HashSet<std::net::SocketAddr>>()
     ));
     let static_set_for_gui = static_set.clone();
-    let _ = static_set_for_gui;
 
     let server_handle = {
         let tx = pkt_broadcast_tx.clone();
@@ -131,6 +129,22 @@ async fn main() {
             )
             .await;
         })
+    };
+
+    let gui_handle = if cfg.gui.enabled {
+        let gui_cfg = cfg.gui.clone();
+        let handles = Arc::new(gui::GuiHandles {
+            static_set: static_set_for_gui.clone(),
+            waveform_tap: wave_tap_for_gui.clone(),
+            config_path: std::path::PathBuf::from("config.toml"),
+        });
+        Some(tokio::spawn(async move {
+            if let Err(e) = gui::start_gui(gui_cfg, handles).await {
+                eprintln!("GUI error: {}", e);
+            }
+        }))
+    } else {
+        None
     };
 
     // ── Start transport client + playback ──
@@ -324,6 +338,9 @@ async fn main() {
 
     server_handle.abort();
     if let Some(h) = client_handle {
+        h.abort();
+    }
+    if let Some(h) = gui_handle {
         h.abort();
     }
 
