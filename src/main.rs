@@ -86,8 +86,10 @@ async fn main() {
 
     // ── Start transport server ──
 
+    use std::collections::HashSet;
+
     // Parse static_receivers: skip invalid entries with a log.
-    let static_receivers: Vec<std::net::SocketAddr> = cfg
+    let static_receivers_parsed: Vec<std::net::SocketAddr> = cfg
         .sender
         .static_receivers
         .iter()
@@ -100,17 +102,24 @@ async fn main() {
         })
         .collect();
 
+    let static_set = Arc::new(arc_swap::ArcSwap::from_pointee(
+        static_receivers_parsed.iter().copied().collect::<HashSet<std::net::SocketAddr>>()
+    ));
+    let static_set_for_gui = static_set.clone();
+    let _ = static_set_for_gui;
+
     let server_handle = {
         let tx = pkt_broadcast_tx.clone();
         let protocol = cfg.sender.protocol.clone();
         let port = cfg.sender.listen_port;
         let max_clients = cfg.sender.max_clients;
+        let static_set_for_server = static_set.clone();
         tokio::spawn(async move {
             start_server(
                 &protocol,
                 port,
                 max_clients,
-                static_receivers,
+                static_set_for_server,
                 tx,
                 tokio::signal::ctrl_c(),
             )

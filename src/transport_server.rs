@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -13,7 +14,7 @@ use tokio::time::{Duration, Instant};
 pub async fn start_udp_server(
     port: usize,
     max_clients: usize,
-    static_receivers: Vec<SocketAddr>,
+    static_set: Arc<ArcSwap<HashSet<SocketAddr>>>,
     pkt_sender: broadcast::Sender<Bytes>,
     shutdown: impl Future,
 ) {
@@ -24,8 +25,7 @@ pub async fn start_udp_server(
     );
     println!("UDP server listening on port {}", port);
 
-    let static_set: Arc<HashSet<SocketAddr>> =
-        Arc::new(static_receivers.iter().copied().collect());
+    let initial_statics: Vec<SocketAddr> = static_set.load().iter().copied().collect();
     let clients: Arc<tokio::sync::Mutex<HashMap<SocketAddr, Instant>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
@@ -33,11 +33,11 @@ pub async fn start_udp_server(
     {
         let mut map = clients.lock().await;
         let now = Instant::now();
-        for addr in &static_receivers {
+        for addr in &initial_statics {
             map.insert(*addr, now);
         }
-        if !static_receivers.is_empty() {
-            println!("Static receivers: {:?}", static_receivers);
+        if !initial_statics.is_empty() {
+            println!("Static receivers: {:?}", initial_statics);
         }
     }
 
@@ -52,7 +52,7 @@ pub async fn start_udp_server(
                 Ok((_, addr)) => {
                     let mut map = reg_clients.lock().await;
                     // max_clients applies to dynamic only; static entries are added on top.
-                    let dynamic_cap = max_clients + reg_static.len();
+                    let dynamic_cap = max_clients + reg_static.load().len();
                     if map.len() < dynamic_cap || map.contains_key(&addr) {
                         map.insert(addr, Instant::now());
                     }
@@ -83,8 +83,9 @@ pub async fn start_udp_server(
             let addrs: Vec<SocketAddr> = {
                 let mut map = send_clients.lock().await;
                 let now = Instant::now();
+                let current_statics = send_static.load();
                 map.retain(|addr, last_seen| {
-                    send_static.contains(addr)
+                    current_statics.contains(addr)
                         || now.duration_since(*last_seen) < Duration::from_secs(5)
                 });
                 map.keys().cloned().collect()
@@ -169,17 +170,17 @@ pub async fn start_tcp_server(
 }
 
 /// Start the appropriate server based on protocol config.
-/// `static_receivers` is only used by UDP; TCP mode ignores it.
+/// `static_set` is only used by UDP; TCP mode ignores it.
 pub async fn start_server(
     protocol: &str,
     port: usize,
     max_clients: usize,
-    static_receivers: Vec<SocketAddr>,
+    static_set: Arc<ArcSwap<HashSet<SocketAddr>>>,
     pkt_sender: broadcast::Sender<Bytes>,
     shutdown: impl Future,
 ) {
     match protocol {
-        "udp" => start_udp_server(port, max_clients, static_receivers, pkt_sender, shutdown).await,
+        "udp" => start_udp_server(port, max_clients, static_set, pkt_sender, shutdown).await,
         "tcp" => start_tcp_server(port, max_clients, pkt_sender, shutdown).await,
         other => panic!("Unknown sender protocol: {}", other),
     }
