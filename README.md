@@ -64,6 +64,23 @@ static_receivers = ["192.168.1.100:7999"]
 
 Config is read from `./config.toml`. Ctrl+C to stop.
 
+## Web GUI
+
+On startup the binary serves a web GUI at `http://<bind_addr>:<port>` (default `http://0.0.0.0:8080`). Log in with the password from `[gui] password` (default: `test`).
+
+Features:
+- Edit `config.toml` in the browser. `static_receivers` hot-reloads; other fields prompt "restart required"
+- Live waveform of the primary capture device's channel 0
+- Restart button (requires systemd/supervisor to auto-relaunch)
+
+```toml
+[gui]
+enabled = true           # set false to disable
+bind_addr = "0.0.0.0"    # use "127.0.0.1" to restrict to local
+port = 8080
+password = "test"        # empty = no auth
+```
+
 ## Packet Format
 
 Header (12 bytes, LE) + channel-major payload:
