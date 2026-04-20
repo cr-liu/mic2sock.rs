@@ -119,20 +119,26 @@ async fn main() {
     };
 
     // ── Start transport client + playback ──
+    // Only start the client if a receiver host is configured.
+    // host = "none" (or empty) means "sender only, no incoming stream".
 
     let (recv_tx, mut recv_rx) = mpsc::channel::<Vec<u8>>(4);
+    let receiver_enabled = cfg.receiver.host != "none" && !cfg.receiver.host.is_empty();
 
-    let client_handle = {
+    let client_handle = if receiver_enabled {
         let protocol = cfg.receiver.protocol.clone();
         let host = cfg.receiver.host.clone();
         let port = cfg.receiver.port;
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             start_client(&protocol, &host, port, recv_pkt_len, recv_tx, tokio::signal::ctrl_c()).await;
-        })
+        }))
+    } else {
+        drop(recv_tx); // Close the sender so recv_rx.recv() returns None cleanly
+        None
     };
 
     // Start playback if receiver is configured (always mono, plays ch0 only)
-    let _playback_stream = if cfg.receiver.host != "none" {
+    let _playback_stream = if receiver_enabled {
         let (pb_producer, pb_consumer) = create_playback_ring(sample_per_packet, 1);
         let ch0_bytes_len = sample_per_packet * 2;
 
@@ -182,9 +188,7 @@ async fn main() {
             }
         }
     } else {
-        tokio::spawn(async move {
-            while recv_rx.recv().await.is_some() {}
-        });
+        drop(recv_rx);
         None
     };
 
@@ -304,7 +308,9 @@ async fn main() {
     }
 
     server_handle.abort();
-    client_handle.abort();
+    if let Some(h) = client_handle {
+        h.abort();
+    }
 
     for handle in capture_threads {
         let _ = handle.join();
