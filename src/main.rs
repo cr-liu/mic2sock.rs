@@ -109,15 +109,16 @@ async fn main() {
         })
     };
 
-    // Start playback if receiver is configured
+    // Start playback if receiver is configured (always mono, plays ch0 only)
     let _playback_stream = if cfg.receiver.host != "none" {
-        let (pb_producer, pb_consumer) = create_playback_ring(sample_per_packet, cfg.receiver.n_channel);
+        let (pb_producer, pb_consumer) = create_playback_ring(sample_per_packet, 1);
+        let ch0_bytes_len = sample_per_packet * 2;
 
         tokio::spawn(async move {
             let mut pb_producer = pb_producer;
             let mut last_pkt_id: Option<i32> = None;
             while let Some(pkt) = recv_rx.recv().await {
-                if pkt.len() < HEADER_LEN {
+                if pkt.len() < HEADER_LEN + ch0_bytes_len {
                     continue;
                 }
                 let pkt_id = i32::from_le_bytes(pkt[8..12].try_into().unwrap());
@@ -130,12 +131,12 @@ async fn main() {
                         // Out of order or too far behind — drop
                         continue;
                     }
-                    // diff in 1..=1000: normal forward progression (with possible gap)
                 }
                 last_pkt_id = Some(pkt_id);
 
-                let audio_data = &pkt[HEADER_LEN..];
-                let samples: Vec<i16> = audio_data
+                // Channel-major format: ch0 is the first block after header
+                let ch0_bytes = &pkt[HEADER_LEN..HEADER_LEN + ch0_bytes_len];
+                let samples: Vec<i16> = ch0_bytes
                     .chunks_exact(2)
                     .map(|c| i16::from_le_bytes([c[0], c[1]]))
                     .collect();
@@ -147,7 +148,7 @@ async fn main() {
         match start_playback(
             &cfg.playback.device_name,
             sample_rate,
-            cfg.receiver.n_channel,
+            1,
             period,
             pb_consumer,
             shutdown.clone(),
@@ -242,26 +243,21 @@ async fn main() {
             pkt.put_i16_le(ms);
             pkt.put_i32_le(pkt_id);
 
-            let primary_samples = sample_per_packet * primary_n_ch;
-            let primary_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    primary_accum.as_ptr() as *const u8,
-                    primary_samples * 2,
-                )
-            };
-            pkt.put_slice(primary_bytes);
-            primary_accum.drain(..primary_samples);
+            // De-interleave: write channel-major (per-channel blocks) across all devices
+            for ch in 0..primary_n_ch {
+                for frame_idx in 0..sample_per_packet {
+                    pkt.put_i16_le(primary_accum[frame_idx * primary_n_ch + ch]);
+                }
+            }
+            primary_accum.drain(..sample_per_packet * primary_n_ch);
 
             for (idx, (n_ch, _)) in secondary_consumers.iter().enumerate() {
-                let sec_samples = sample_per_packet * n_ch;
-                let sec_bytes = unsafe {
-                    std::slice::from_raw_parts(
-                        secondary_accums[idx].as_ptr() as *const u8,
-                        sec_samples * 2,
-                    )
-                };
-                pkt.put_slice(sec_bytes);
-                secondary_accums[idx].drain(..sec_samples);
+                for ch in 0..*n_ch {
+                    for frame_idx in 0..sample_per_packet {
+                        pkt.put_i16_le(secondary_accums[idx][frame_idx * n_ch + ch]);
+                    }
+                }
+                secondary_accums[idx].drain(..sample_per_packet * n_ch);
             }
 
             let packet = pkt.freeze();
