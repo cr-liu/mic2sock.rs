@@ -1,0 +1,7 @@
+body { font-family: sans-serif; max-width: 960px; margin: 20px auto; padding: 0 20px; }
+canvas { border: 1px solid #ccc; width: 100%; display: block; }
+#stats { margin: 10px 0; font-family: monospace; }
+#config { margin: 20px 0; }
+button { margin-right: 8px; padding: 8px 16px; }
+fieldset { margin: 8px 0; }
+legend { font-weight: bold; }

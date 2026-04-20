@@ -8,6 +8,7 @@ mod transport_server;
 use transport_server::start_server;
 mod transport_client;
 use transport_client::start_client;
+mod gui;
 
 use bytes::{Bytes, BytesMut, BufMut};
 use crossbeam::channel::bounded;
