@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,6 +13,7 @@ use tokio::time::{Duration, Instant};
 pub async fn start_udp_server(
     port: usize,
     max_clients: usize,
+    static_receivers: Vec<SocketAddr>,
     pkt_sender: broadcast::Sender<Bytes>,
     shutdown: impl Future,
 ) {
@@ -23,19 +24,36 @@ pub async fn start_udp_server(
     );
     println!("UDP server listening on port {}", port);
 
+    let static_set: Arc<HashSet<SocketAddr>> =
+        Arc::new(static_receivers.iter().copied().collect());
     let clients: Arc<tokio::sync::Mutex<HashMap<SocketAddr, Instant>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+    // Pre-populate static entries synchronously before spawning tasks.
+    {
+        let mut map = clients.lock().await;
+        let now = Instant::now();
+        for addr in &static_receivers {
+            map.insert(*addr, now);
+        }
+        if !static_receivers.is_empty() {
+            println!("Static receivers: {:?}", static_receivers);
+        }
+    }
 
     // Registration listener task
     let reg_socket = socket.clone();
     let reg_clients = clients.clone();
+    let reg_static = static_set.clone();
     let reg_handle = tokio::spawn(async move {
         let mut buf = [0u8; 64];
         loop {
             match reg_socket.recv_from(&mut buf).await {
                 Ok((_, addr)) => {
                     let mut map = reg_clients.lock().await;
-                    if map.len() < max_clients || map.contains_key(&addr) {
+                    // max_clients applies to dynamic only; static entries are added on top.
+                    let dynamic_cap = max_clients + reg_static.len();
+                    if map.len() < dynamic_cap || map.contains_key(&addr) {
                         map.insert(addr, Instant::now());
                     }
                 }
@@ -49,6 +67,7 @@ pub async fn start_udp_server(
     // Broadcast sender task
     let send_socket = socket.clone();
     let send_clients = clients.clone();
+    let send_static = static_set.clone();
     let mut receiver = pkt_sender.subscribe();
     let send_handle = tokio::spawn(async move {
         loop {
@@ -64,7 +83,10 @@ pub async fn start_udp_server(
             let addrs: Vec<SocketAddr> = {
                 let mut map = send_clients.lock().await;
                 let now = Instant::now();
-                map.retain(|_, last_seen| now.duration_since(*last_seen) < Duration::from_secs(5));
+                map.retain(|addr, last_seen| {
+                    send_static.contains(addr)
+                        || now.duration_since(*last_seen) < Duration::from_secs(5)
+                });
                 map.keys().cloned().collect()
             };
             for addr in &addrs {
@@ -147,15 +169,17 @@ pub async fn start_tcp_server(
 }
 
 /// Start the appropriate server based on protocol config.
+/// `static_receivers` is only used by UDP; TCP mode ignores it.
 pub async fn start_server(
     protocol: &str,
     port: usize,
     max_clients: usize,
+    static_receivers: Vec<SocketAddr>,
     pkt_sender: broadcast::Sender<Bytes>,
     shutdown: impl Future,
 ) {
     match protocol {
-        "udp" => start_udp_server(port, max_clients, pkt_sender, shutdown).await,
+        "udp" => start_udp_server(port, max_clients, static_receivers, pkt_sender, shutdown).await,
         "tcp" => start_tcp_server(port, max_clients, pkt_sender, shutdown).await,
         other => panic!("Unknown sender protocol: {}", other),
     }

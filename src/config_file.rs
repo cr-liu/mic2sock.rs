@@ -40,6 +40,8 @@ pub struct SenderConfig {
     pub protocol: String,
     pub listen_port: usize,
     pub max_clients: usize,
+    #[serde(default)]
+    pub static_receivers: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -103,6 +105,7 @@ impl Config {
                 protocol: "udp".to_string(),
                 listen_port: 7998,
                 max_clients: 100,
+                static_receivers: Vec::new(),
             },
             receiver: ReceiverConfig {
                 protocol: "udp".to_string(),

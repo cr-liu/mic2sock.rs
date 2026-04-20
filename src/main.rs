@@ -86,13 +86,35 @@ async fn main() {
 
     // ── Start transport server ──
 
+    // Parse static_receivers: skip invalid entries with a log.
+    let static_receivers: Vec<std::net::SocketAddr> = cfg
+        .sender
+        .static_receivers
+        .iter()
+        .filter_map(|s| match s.parse() {
+            Ok(addr) => Some(addr),
+            Err(e) => {
+                eprintln!("invalid static_receiver '{}': {}", s, e);
+                None
+            }
+        })
+        .collect();
+
     let server_handle = {
         let tx = pkt_broadcast_tx.clone();
         let protocol = cfg.sender.protocol.clone();
         let port = cfg.sender.listen_port;
         let max_clients = cfg.sender.max_clients;
         tokio::spawn(async move {
-            start_server(&protocol, port, max_clients, tx, tokio::signal::ctrl_c()).await;
+            start_server(
+                &protocol,
+                port,
+                max_clients,
+                static_receivers,
+                tx,
+                tokio::signal::ctrl_c(),
+            )
+            .await;
         })
     };
 
