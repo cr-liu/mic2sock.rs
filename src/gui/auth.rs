@@ -2,15 +2,16 @@ use axum::{
     extract::State,
     http::{header, StatusCode, Request},
     middleware::Next,
-    response::Response,
+    response::{Response, IntoResponse, Redirect},
     body::Body,
 };
-use base64::{engine::general_purpose, Engine as _};
 use subtle::ConstantTimeEq;
 use std::sync::Arc;
 
 pub struct AuthState {
     pub password: Arc<String>,
+    /// Session token that a valid cookie must match. Random per-startup.
+    pub token: Arc<String>,
 }
 
 pub async fn auth_middleware(
@@ -22,31 +23,45 @@ pub async fn auth_middleware(
         return Ok(next.run(req).await);
     }
 
-    if let Some(auth) = req.headers().get(header::AUTHORIZATION) {
-        if let Ok(s) = auth.to_str() {
-            if let Some(b64) = s.strip_prefix("Basic ") {
-                if let Ok(decoded) = general_purpose::STANDARD.decode(b64) {
-                    if let Ok(text) = std::str::from_utf8(&decoded) {
-                        if let Some((_user, pass)) = text.split_once(':') {
-                            let pw_bytes = pass.as_bytes();
-                            let expected = state.password.as_bytes();
-                            if pw_bytes.len() == expected.len()
-                                && pw_bytes.ct_eq(expected).into()
-                            {
-                                return Ok(next.run(req).await);
-                            }
-                        }
-                    }
-                }
+    let path = req.uri().path();
+
+    // Always allow the login endpoints (GET form, POST submit) and static login asset.
+    if path == "/login" || path == "/login.html" {
+        return Ok(next.run(req).await);
+    }
+
+    if cookie_is_valid(req.headers(), &state.token) {
+        return Ok(next.run(req).await);
+    }
+
+    // Distinguish browser navigation vs API/WebSocket requests.
+    let is_api = path.starts_with("/api/") || path.starts_with("/ws/");
+
+    if is_api {
+        let mut response = Response::new(Body::from("Unauthorized"));
+        *response.status_mut() = StatusCode::UNAUTHORIZED;
+        Ok(response)
+    } else {
+        Ok(Redirect::to("/login").into_response())
+    }
+}
+
+fn cookie_is_valid(headers: &axum::http::HeaderMap, expected: &str) -> bool {
+    let Some(cookie_header) = headers.get(header::COOKIE) else {
+        return false;
+    };
+    let Ok(text) = cookie_header.to_str() else {
+        return false;
+    };
+    for pair in text.split(';') {
+        let pair = pair.trim();
+        if let Some(value) = pair.strip_prefix("auth=") {
+            if value.len() == expected.len()
+                && value.as_bytes().ct_eq(expected.as_bytes()).into()
+            {
+                return true;
             }
         }
     }
-
-    let mut response = Response::new(Body::from("Unauthorized"));
-    *response.status_mut() = StatusCode::UNAUTHORIZED;
-    response.headers_mut().insert(
-        header::WWW_AUTHENTICATE,
-        "Basic realm=\"mic2sock\"".parse().unwrap(),
-    );
-    Ok(response)
+    false
 }

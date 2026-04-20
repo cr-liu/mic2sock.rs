@@ -1,5 +1,6 @@
 mod auth;
 mod config_api;
+mod login;
 mod waveform;
 
 use axum::{
@@ -12,6 +13,7 @@ use axum::{
 use std::sync::Arc;
 use std::net::SocketAddr;
 use std::collections::HashSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use tokio::sync::broadcast;
 
@@ -48,6 +50,31 @@ pub struct GuiHandles {
     pub config_path: std::path::PathBuf,
 }
 
+/// Minimal token generator — reads /dev/urandom on Unix, or hashes high-res
+/// timestamp on other platforms as a fallback. Sufficient for LAN auth.
+fn generate_token() -> String {
+    let mut buf = [0u8; 32];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| {
+            use std::io::Read;
+            f.read_exact(&mut buf)
+        })
+        .is_err()
+    {
+        // Fallback: mix nanos with addr of local for uniqueness
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let local_ptr = &buf as *const _ as usize;
+        let mix = nanos ^ (local_ptr as u128);
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = ((mix >> (i * 4)) & 0xff) as u8;
+        }
+    }
+    buf.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 pub async fn start_gui(
     cfg: GuiConfig,
     handles: Arc<GuiHandles>,
@@ -63,7 +90,12 @@ pub async fn start_gui(
 
     let auth_state = Arc::new(auth::AuthState {
         password: Arc::new(cfg.password.clone()),
+        token: Arc::new(generate_token()),
     });
+
+    let login_routes: Router = Router::new()
+        .route("/login", get(login::get_login).post(login::post_login))
+        .with_state(auth_state.clone());
 
     let api_routes: Router = Router::new()
         .route(
@@ -78,6 +110,7 @@ pub async fn start_gui(
         .route("/", get(serve_html))
         .route("/app.js", get(serve_js))
         .route("/style.css", get(serve_css))
+        .merge(login_routes)
         .merge(api_routes)
         .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
         .layer(middleware::from_fn_with_state(auth_state, auth::auth_middleware));

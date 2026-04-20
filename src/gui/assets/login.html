@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Login — mic2sock</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="login-box">
+    <h1>mic2sock</h1>
+    <form id="login-form">
+      <input type="password" id="password" placeholder="Password" autofocus>
+      <button type="submit">Login</button>
+    </form>
+    <div id="err"></div>
+  </div>
+  <script>
+    const form = document.getElementById('login-form');
+    const pwInput = document.getElementById('password');
+    const errDiv = document.getElementById('err');
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      errDiv.textContent = '';
+      const res = await fetch('/login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ password: pwInput.value }),
+      });
+      if (res.ok) {
+        location.href = '/';
+      } else {
+        errDiv.textContent = 'Wrong password';
+        pwInput.select();
+      }
+    };
+  </script>
+</body>
+</html>

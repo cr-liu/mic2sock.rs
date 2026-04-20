@@ -1,7 +1,177 @@
-body { font-family: sans-serif; max-width: 960px; margin: 20px auto; padding: 0 20px; }
-canvas { border: 1px solid #ccc; width: 100%; display: block; }
-#stats { margin: 10px 0; font-family: monospace; }
+body {
+  font-family: sans-serif;
+  max-width: 960px;
+  margin: 20px auto;
+  padding: 0 20px;
+  color: #222;
+}
+
+canvas {
+  border: 1px solid #ccc;
+  width: 100%;
+  display: block;
+  background: #fafafa;
+}
+
+#stats {
+  margin: 10px 0;
+  font-family: monospace;
+  color: #555;
+}
+
 #config { margin: 20px 0; }
-button { margin-right: 8px; padding: 8px 16px; }
-fieldset { margin: 8px 0; }
-legend { font-weight: bold; }
+
+fieldset {
+  margin: 12px 0;
+  padding: 12px 16px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+}
+
+legend {
+  font-weight: bold;
+  color: #555;
+  padding: 0 6px;
+}
+
+/* Each field is a grid row: label on left, input on right, aligned. */
+fieldset > div {
+  display: grid;
+  grid-template-columns: 180px 1fr;
+  align-items: center;
+  gap: 12px;
+  margin: 4px 0;
+}
+
+fieldset > div > label {
+  text-align: right;
+  color: #444;
+  font-size: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The label row for array-typed fields (like static_receivers) isn't a simple
+   grid, so override to block layout. */
+fieldset > div:has(ul) {
+  display: block;
+}
+
+fieldset > div:has(ul) > div {
+  text-align: left;
+  font-size: 14px;
+  color: #444;
+  margin-bottom: 4px;
+}
+
+fieldset > div > input[type="text"],
+fieldset > div > input[type="number"] {
+  box-sizing: border-box;
+  padding: 6px 8px;
+  border: 1px solid #bbb;
+  border-radius: 3px;
+  font-size: 14px;
+  width: 100%;
+}
+
+fieldset > div > input[type="checkbox"] {
+  justify-self: start;
+  width: 18px;
+  height: 18px;
+}
+
+/* Array items (ul > li) */
+ul {
+  list-style: none;
+  padding: 0;
+  margin: 4px 0;
+}
+
+ul > li {
+  display: flex;
+  gap: 8px;
+  margin: 3px 0;
+  align-items: center;
+}
+
+ul > li > input {
+  flex: 1;
+  padding: 6px 8px;
+  border: 1px solid #bbb;
+  border-radius: 3px;
+  font-size: 14px;
+}
+
+ul > li > button {
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  background: #eee;
+  border: 1px solid #bbb;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+/* Action buttons at bottom */
+body > button {
+  margin: 8px 8px 0 0;
+  padding: 8px 16px;
+  background: #fff;
+  border: 1px solid #bbb;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+body > button:hover { background: #f0f0f0; }
+
+/* Add-button for list fields */
+fieldset > div:has(ul) > button {
+  margin-top: 4px;
+  padding: 4px 10px;
+  background: #eef;
+  border: 1px solid #99c;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+/* Login page */
+.login-box {
+  max-width: 320px;
+  margin: 100px auto;
+  text-align: center;
+}
+
+.login-box h1 {
+  margin-bottom: 24px;
+}
+
+.login-box input[type="password"] {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 12px;
+  font-size: 16px;
+  border: 1px solid #bbb;
+  border-radius: 4px;
+  margin-bottom: 12px;
+}
+
+.login-box button {
+  width: 100%;
+  padding: 10px;
+  font-size: 16px;
+  background: #4a90e2;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.login-box button:hover { background: #357ac0; }
+
+#err {
+  color: #c33;
+  margin-top: 10px;
+  min-height: 1em;
+}
