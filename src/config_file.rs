@@ -12,6 +12,8 @@ pub struct Config {
     pub playback: PlaybackConfig,
     pub sender: SenderConfig,
     pub receiver: ReceiverConfig,
+    #[serde(default)]
+    pub gui: GuiConfig,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -42,6 +44,34 @@ pub struct SenderConfig {
     pub max_clients: usize,
     #[serde(default)]
     pub static_receivers: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct GuiConfig {
+    #[serde(default = "default_gui_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_gui_bind_addr")]
+    pub bind_addr: String,
+    #[serde(default = "default_gui_port")]
+    pub port: u16,
+    #[serde(default = "default_gui_password")]
+    pub password: String,
+}
+
+fn default_gui_enabled() -> bool { true }
+fn default_gui_bind_addr() -> String { "0.0.0.0".to_string() }
+fn default_gui_port() -> u16 { 8080 }
+fn default_gui_password() -> String { "test".to_string() }
+
+impl Default for GuiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_gui_enabled(),
+            bind_addr: default_gui_bind_addr(),
+            port: default_gui_port(),
+            password: default_gui_password(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -114,6 +144,7 @@ impl Config {
                 n_channel: 1,
                 pkt_len: None,
             },
+            gui: GuiConfig::default(),
         }
     }
 }

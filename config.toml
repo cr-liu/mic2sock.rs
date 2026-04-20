@@ -6,8 +6,10 @@ sample_per_packet = 32
 device_id = 0
 
 [[capture_device]]
-device_name = "hw:RASPZX16ch"
-n_channel = 16
+# device_name = "hw:RASPZX16ch"
+# n_channel = 16
+device_name = "plughw:Generic_1,2"
+n_channel = 2
 
 [playback]
 device_name = "plughw:Device"
@@ -28,3 +30,9 @@ n_channel = 1
 # Set this when receiving from a sender with a different total channel count.
 # e.g. sender with 18ch, sample_per_packet=32: 12 + 18 * 32 * 2 = 1164
 # pkt_len = 1164
+
+[gui]
+enabled = true
+bind_addr = "0.0.0.0"
+port = 8080
+password = "test"
