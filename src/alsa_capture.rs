@@ -47,6 +47,7 @@ pub fn start_primary_capture(
     period: usize,
     n_period: usize,
     sender: Sender<Vec<i16>>,
+    waveform_tap: tokio::sync::broadcast::Sender<Vec<i16>>,
     shutdown: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -85,6 +86,10 @@ pub fn start_primary_capture(
                     if n != period {
                         eprintln!("Primary capture: short read {} < {}", n, period);
                     }
+                    // Extract ch0 samples for waveform tap (no-op if no subscribers)
+                    let ch0_samples: Vec<i16> = (0..n).map(|i| buf[i * device.n_channel]).collect();
+                    let _ = waveform_tap.send(ch0_samples);
+
                     if sender.send(buf.clone()).is_err() {
                         break;
                     }

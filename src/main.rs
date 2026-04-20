@@ -47,6 +47,10 @@ async fn main() {
 
     let (primary_tx, primary_rx) = bounded::<Vec<i16>>(2);
 
+    let (wave_tap_tx, _) = tokio::sync::broadcast::channel::<Vec<i16>>(4);
+    let wave_tap_for_gui = wave_tap_tx.clone();
+    let _ = wave_tap_for_gui;
+
     let mut secondary_consumers = Vec::new();
     let mut capture_threads = Vec::new();
 
@@ -63,6 +67,7 @@ async fn main() {
                 period,
                 n_period,
                 primary_tx.clone(),
+                wave_tap_tx.clone(),
                 shutdown.clone(),
             ));
         } else {
