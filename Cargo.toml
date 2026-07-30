@@ -1,15 +1,8 @@
-[package]
-name = "mic2sock"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+resolver = "2"
+members = ["protocol", "clocksync", "mic2sock"]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[dependencies]
-jack = { version = "0.11" }
-serde = { version = "1.0", features = ["derive", "std"] }
-toml = "0.7"
-tokio = { version = "1.28", features = ["full"] }
-bytes = "1.4"
-crossbeam = "0.8"
-arc-swap = "1.6"
+# 排除 mic2sock：它需要 libjack，在无 libjack 的机器（含 CI 容器）上
+# 无法构建。这样 `cargo build` / `cargo test` 默认只处理纯逻辑 crate。
+# Pi 上构建守护进程用：cargo build -p mic2sock --release
+default-members = ["protocol", "clocksync"]
