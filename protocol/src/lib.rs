@@ -12,8 +12,7 @@ pub mod header;
 pub mod layout;
 
 pub use backlog::Backlog;
-// re-exported once the module lands
-// pub use backoff::Backoff;
+pub use backoff::Backoff;
 // block deliberately has no re-export: it exposes free functions
 // (deblock_channel / reblock_channel), meant to be reached as
 // protocol::block::...
