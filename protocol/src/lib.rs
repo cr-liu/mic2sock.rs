@@ -11,8 +11,7 @@ pub mod gap;
 pub mod header;
 pub mod layout;
 
-// re-exported once the module lands
-// pub use backlog::Backlog;
+pub use backlog::Backlog;
 // re-exported once the module lands
 // pub use backoff::Backoff;
 // block deliberately has no re-export: it exposes free functions
