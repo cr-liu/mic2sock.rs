@@ -2,6 +2,10 @@
 name = "mic2sock"
 version = "0.1.0"
 edition = "2021"
+# Load-bearing: a low rust-version is what makes cargo emit a v3 Cargo.lock.
+# Lockfile v4 needs cargo >=1.80 and Debian bookworm (the Pi) ships 1.63, where
+# a v4 lockfile fails to parse before anything is compiled. Not self-enforcing:
+# a routine `cargo update` can raise a dep's own MSRV past this without warning.
 rust-version = "1.63"
 
 [dependencies]
