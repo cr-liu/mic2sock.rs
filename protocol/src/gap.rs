@@ -35,7 +35,7 @@ fn retreat(id: i32) -> i32 {
     if id == 0 {
         i32::MAX - 1
     } else {
-        id - 1
+        id.wrapping_sub(1)
     }
 }
 
@@ -242,5 +242,23 @@ mod tests {
         t2.observe(1000);
         // 9 missing exceeds the limit, so Resync.
         assert_eq!(t2.observe(1010), GapAction::Resync);
+    }
+
+    #[test]
+    fn reorder_window_boundary() {
+        let mut t = tracker();
+        for id in 1000..1020 {
+            t.observe(id);
+        }
+        // next_id == 1020; 1004 is exactly reorder_window (16) packets back, the
+        // last distance still covered by the backward walk, so still Drop.
+        assert_eq!(t.observe(1004), GapAction::Drop);
+
+        let mut t2 = tracker();
+        for id in 1000..1020 {
+            t2.observe(id);
+        }
+        // 1003 is 17 packets back, one past the window, so Resync.
+        assert_eq!(t2.observe(1003), GapAction::Resync);
     }
 }

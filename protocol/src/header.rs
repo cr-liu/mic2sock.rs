@@ -63,19 +63,25 @@ mod tests {
     /// Golden-bytes test: pins the wire format. If this fails, the closed-source
     /// consumer on the Windows box receives malformed packets. No refactor may
     /// change it.
+    ///
+    /// The field values must stay nonzero and asymmetric under byte reversal: a
+    /// zero field is indistinguishable from a field that was never written at
+    /// all, and a byte-palindrome value (like `-1i16`, `0xFFFF`) reads the same
+    /// regardless of endianness, so either kind of value would let a real
+    /// wire-format bug slip through this test undetected.
     #[test]
     fn golden_bytes() {
         let h = Header {
-            device_id: 0,
+            device_id: 0xABCD,
             secs: 0x1122_3344,
-            ms: -1,
+            ms: 0x1234,
             pkt_id: 7,
         };
         let mut buf = [0u8; HEADER_LEN];
         h.write_to(&mut buf);
         assert_eq!(
             buf,
-            [0x00, 0x00, 0x44, 0x33, 0x22, 0x11, 0xFF, 0xFF, 0x07, 0x00, 0x00, 0x00]
+            [0xCD, 0xAB, 0x44, 0x33, 0x22, 0x11, 0x34, 0x12, 0x07, 0x00, 0x00, 0x00]
         );
     }
 

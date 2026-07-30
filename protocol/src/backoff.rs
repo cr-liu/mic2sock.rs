@@ -16,7 +16,13 @@ impl Backoff {
     /// * `max_ms` — a hard ceiling for any attempt.
     /// * `seed` — LCG seed; different connections should use different seeds so
     ///   they do not reconnect in lockstep.
+    ///
+    /// # Panics
+    /// Panics if `base_ms > max_ms`, which is a configuration or programming
+    /// error; this project's convention is to fail loudly on those rather than
+    /// silently using `min(base_ms, max_ms)` as the real first-attempt ceiling.
     pub fn new(base_ms: u64, max_ms: u64, seed: u64) -> Self {
+        assert!(base_ms <= max_ms, "base_ms must be <= max_ms");
         Backoff {
             base_ms,
             max_ms,
@@ -51,13 +57,23 @@ impl Backoff {
             .wrapping_add(1_442_695_040_888_963_407);
         let r = self.rng >> 33;
 
-        Duration::from_millis(if ceiling == 0 { 0 } else { r % (ceiling + 1) })
+        Duration::from_millis(if ceiling == 0 {
+            0
+        } else {
+            r % ceiling.saturating_add(1)
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[should_panic(expected = "base_ms must be <= max_ms")]
+    fn base_greater_than_max_is_a_configuration_error() {
+        Backoff::new(5000, 200, 1);
+    }
 
     #[test]
     fn first_delay_is_within_base() {
