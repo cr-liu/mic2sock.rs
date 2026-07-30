@@ -18,7 +18,6 @@ pub mod layout;
 // block deliberately has no re-export: it exposes free functions
 // (deblock_channel / reblock_channel), meant to be reached as
 // protocol::block::...
-// re-exported once the module lands
-// pub use gap::{GapAction, GapTracker};
+pub use gap::{GapAction, GapTracker};
 pub use header::{Header, HEADER_LEN};
 pub use layout::PacketLayout;
