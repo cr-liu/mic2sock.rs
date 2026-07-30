@@ -20,7 +20,6 @@ pub mod layout;
 // protocol::block::...
 // re-exported once the module lands
 // pub use gap::{GapAction, GapTracker};
-// re-exported once the module lands
-// pub use header::{Header, HEADER_LEN};
+pub use header::{Header, HEADER_LEN};
 // re-exported once the module lands
 // pub use layout::PacketLayout;
