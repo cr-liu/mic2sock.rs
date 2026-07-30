@@ -16,10 +16,18 @@ pub fn interpolate(y0: f64, y1: f64, y2: f64, y3: f64, x: f64) -> f64 {
     ((c3 * x + c2) * x + c1) * x + c0
 }
 
-/// Rounds to nearest and saturates into `i16`.
+/// Rounds half-up and saturates into `i16`.
+///
+/// Half-up rather than half-away-from-zero because it is translation invariant:
+/// `to_i16(v + n) == to_i16(v) + n` for integer `n`, whenever `v` and `v + n` are
+/// both exactly representable and neither saturates. `Resampler` depends on that
+/// — it is what lets two channels carrying the same signal at different offsets
+/// resolve an exact tie identically instead of diverging by one LSB, and its Q32
+/// phase is what keeps those values exactly representable. Half-away-from-zero
+/// flips direction across zero and so breaks this outright.
 #[inline]
 pub fn to_i16(v: f64) -> i16 {
-    let r = v.round();
+    let r = (v + 0.5).floor();
     if r > i16::MAX as f64 {
         i16::MAX
     } else if r < i16::MIN as f64 {
@@ -75,6 +83,19 @@ mod tests {
             let x = i as f64 / 10.0;
             let y = interpolate(0.0, 10.0, 20.0, 30.0, x);
             assert!((10.0..=20.0).contains(&y), "x={} y={}", x, y);
+        }
+    }
+
+    /// Translation invariance is what `Resampler` depends on: two channels carrying
+    /// the same signal at different offsets must resolve an exact tie the same way.
+    #[test]
+    fn rounding_is_translation_invariant() {
+        for base in [-20000.0, -1000.5, -0.5, 0.0, 0.5, 1000.5, 20000.0] {
+            for n in [-16i32, -7, -1, 0, 1, 7, 16] {
+                let shifted = to_i16(base + n as f64) as i32;
+                let unshifted = to_i16(base) as i32 + n;
+                assert_eq!(shifted, unshifted, "base={} n={}", base, n);
+            }
         }
     }
 
