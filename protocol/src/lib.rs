@@ -21,5 +21,4 @@ pub mod layout;
 // re-exported once the module lands
 // pub use gap::{GapAction, GapTracker};
 pub use header::{Header, HEADER_LEN};
-// re-exported once the module lands
-// pub use layout::PacketLayout;
+pub use layout::PacketLayout;
