@@ -38,8 +38,8 @@ cargo fmt
 会 panic。所以裸 `cargo build` / `cargo test` 只处理纯逻辑 crate（而且会静默地**不**构建
 守护进程），构建或运行 daemon 必须显式写 `-p mic2sock`。
 
-Run from a directory containing `config.toml` — the path is relative to the CWD, so `cargo run` from
-the repo root works. If `config.toml` is missing or fails to parse, the program does **not** fail: it
+Run from a directory containing `config.toml` — the path is relative to the CWD, so
+`cargo run -p mic2sock` from the repo root works. If `config.toml` is missing or fails to parse, the program does **not** fail: it
 writes defaults to `conf.toml`, prints "please rename it to config.toml", and keeps running on those
 defaults. A confusing config bug is usually this path being hit silently.
 
