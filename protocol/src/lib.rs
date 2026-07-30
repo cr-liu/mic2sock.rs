@@ -10,13 +10,16 @@ pub mod gap;
 pub mod header;
 pub mod layout;
 
-// re-exported once the module lands (Task 6)
+// re-exported once the module lands
 // pub use backlog::Backlog;
-// re-exported once the module lands (Task 7)
+// re-exported once the module lands
 // pub use backoff::Backoff;
-// re-exported once the module lands (Task 5)
+// block deliberately has no re-export: it exposes free functions
+// (deblock_channel / reblock_channel), meant to be reached as
+// protocol::block::...
+// re-exported once the module lands
 // pub use gap::{GapAction, GapTracker};
-// re-exported once the module lands (Task 2)
+// re-exported once the module lands
 // pub use header::{Header, HEADER_LEN};
-// re-exported once the module lands (Task 3)
+// re-exported once the module lands
 // pub use layout::PacketLayout;

@@ -20,10 +20,23 @@ without `jack.pc` the build script panics), and `jackd` on `PATH` at runtime.
 
 ```bash
 sudo apt install libjack-jackd2-dev jackd2   # Debian/Ubuntu; brew install jack on macOS
-cargo build --release
-cargo clippy --all-targets                   # no lint config; plain clippy
+
+# 纯逻辑 crate（protocol / clocksync）—— 不需要 libjack，任何机器/CI 都能跑
+cargo test
+cargo clippy -p protocol -p clocksync --all-targets
+
+# Pi 上的守护进程 —— 需要 libjack
+cargo build -p mic2sock --release
+cargo run -p mic2sock
+cargo clippy -p mic2sock --all-targets
+
 cargo fmt
 ```
+
+这是一个 cargo workspace，`default-members = ["protocol", "clocksync"]` **刻意排除了
+`mic2sock`** —— 后者需要 libjack，在没有 `jack.pc` 的机器上 `jack-sys` 的 build script
+会 panic。所以裸 `cargo build` / `cargo test` 只处理纯逻辑 crate（而且会静默地**不**构建
+守护进程），构建或运行 daemon 必须显式写 `-p mic2sock`。
 
 Run from a directory containing `config.toml` — the path is relative to the CWD, so `cargo run` from
 the repo root works. If `config.toml` is missing or fails to parse, the program does **not** fail: it

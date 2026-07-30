@@ -8,7 +8,9 @@ pub mod depth;
 pub mod hermite;
 pub mod resampler;
 
-// re-exported once the module lands (Task 10)
+// re-exported once the module lands
 // pub use depth::DepthController;
-// re-exported once the module lands (Task 9)
+// hermite deliberately has no re-export: it exposes free functions
+// (interpolate / to_i16), meant to be reached as clocksync::hermite::...
+// re-exported once the module lands
 // pub use resampler::Resampler;
