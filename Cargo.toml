@@ -2,7 +2,8 @@
 resolver = "2"
 members = ["protocol", "clocksync", "mic2sock"]
 
-# 排除 mic2sock：它需要 libjack，在无 libjack 的机器（含 CI 容器）上
-# 无法构建。这样 `cargo build` / `cargo test` 默认只处理纯逻辑 crate。
-# Pi 上构建守护进程用：cargo build -p mic2sock --release
+# mic2sock is excluded: it needs libjack, and jack-sys's build script panics on
+# any machine without jack.pc (including CI containers). So a bare `cargo build`
+# / `cargo test` covers only the pure-logic crates and silently does NOT build
+# the daemon. On the Pi: cargo build -p mic2sock --release
 default-members = ["protocol", "clocksync"]

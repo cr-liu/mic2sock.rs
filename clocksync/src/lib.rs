@@ -1,8 +1,9 @@
-//! 多通道样本流的速率对齐。
+//! Rate alignment for multi-channel sample streams.
 //!
-//! 核心不变量：**所有通道共享同一个相位累加器**。每通道独立取整会产生系统性的
-//! ±1 样本通道间偏差，在 16 kHz 下折合 2.1 cm 等效位置偏移，直接偏置 DOA 估计。
-//! 见 spec §5.2。
+//! Core invariant: **every channel shares one phase accumulator.** Rounding per
+//! channel independently produces a systematic inter-channel offset of up to one
+//! sample, which at 16 kHz is 62.5 us — equivalent to 2.1 cm of apparent source
+//! displacement. That biases DOA estimation, so it is not a rounding nicety.
 
 pub mod depth;
 pub mod hermite;

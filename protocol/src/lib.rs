@@ -1,7 +1,8 @@
-//! mic2sock 线路格式与包流原语。
+//! mic2sock wire format and packet-stream primitives.
 //!
-//! 本 crate 刻意不含任何 IO 与平台依赖：Pi 侧守护进程（Linux/JACK/ALSA）与
-//! Windows 侧 shim 共用它，所以它必须能在两边都编译。
+//! This crate deliberately has no IO and no platform dependencies: the Pi-side
+//! daemon (Linux/JACK/ALSA) and the Windows-side shim both use it, so it has to
+//! compile on either.
 
 pub mod backlog;
 pub mod backoff;
