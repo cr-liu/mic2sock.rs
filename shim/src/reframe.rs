@@ -57,7 +57,9 @@ pub struct Reframer {
 }
 
 impl Reframer {
-    /// `fade_ms` is the ramp used entering and leaving an outage.
+    /// `fade_ms` is the ramp used entering and leaving an outage. `device_id` is only
+    /// the value used before any input packet has been seen — after that the sender's
+    /// own is carried through.
     pub fn new(
         in_layout: PacketLayout,
         out_layout: PacketLayout,
@@ -92,6 +94,13 @@ impl Reframer {
 
     /// Feeds one input packet's audio into the resampler.
     pub fn push_packet(&mut self, packet: &[u8]) {
+        if let Some(h) = Header::parse(packet) {
+            // Carry the sender's device id through rather than stamping our own. The
+            // consumer was connected straight to the array before the shim existed
+            // and may key on this field, so the shim has to be transparent in it.
+            // Kept across silence too, so an outage does not renumber the device.
+            self.device_id = h.device_id;
+        }
         if self.pending_header.is_none() {
             self.pending_header = Header::parse(packet);
         }
@@ -289,17 +298,30 @@ mod tests {
         );
     }
 
+    /// The sender's device id is carried through, not replaced: the consumer was
+    /// wired straight to the array before the shim existed and may key on it. The
+    /// constructor's value is only the pre-first-packet fallback.
     #[test]
-    fn output_header_carries_the_configured_device_id() {
+    fn output_header_carries_the_senders_device_id() {
         let (li, lo) = layouts(160, 160);
         let mut r = Reframer::new(li, lo, 42, 16000, 20);
         let mut out = Vec::new();
         // Two inputs, so that a whole output packet exists past the taps.
+        // `make_input` stamps device_id 5, which must win over the constructor's 42.
         for k in 0..2 {
             r.push_packet(&make_input(&li, k, 0));
             r.drain(1.0, &mut out);
         }
-        assert_eq!(Header::parse(&out[0]).unwrap().device_id, 42);
+        assert_eq!(Header::parse(&out[0]).unwrap().device_id, 5);
+
+        // And it survives an outage, so silence does not renumber the device.
+        let before = out.len();
+        for _ in 0..3 {
+            r.push_silence();
+            r.drain(1.0, &mut out);
+        }
+        assert!(out.len() > before);
+        assert_eq!(Header::parse(out.last().unwrap()).unwrap().device_id, 5);
     }
 
     /// At unity step the audio must pass through unchanged, or the whole

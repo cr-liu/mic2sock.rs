@@ -6,6 +6,7 @@ pub mod config;
 pub mod depth;
 pub mod jitter;
 pub mod metrics;
+pub mod pipeline;
 pub mod reframe;
 pub mod sink;
 pub mod source;
