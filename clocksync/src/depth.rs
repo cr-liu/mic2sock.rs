@@ -10,6 +10,19 @@
 /// what gets heard. An unlimited proportional controller slams `step` to the clamp
 /// the moment error appears, which is precisely the most audible artifact. Rate
 /// limiting means a larger clamp is *less* audible, not more.
+///
+/// **The steady-state correction is proportional-only, so it does not cancel
+/// drift exactly.** Buffer depth integrates `(drift - (step - 1))`, so holding
+/// depth constant requires `step = 1 + drift` exactly — but a pure proportional
+/// law only ever outputs `1 + kp * error_secs`, so sustaining that output takes a
+/// permanent nonzero `error_secs`. The residual steady-state offset works out to
+/// approximately `drift / kp`: at `kp = 1.0` and typical crystal drift of ~50 ppm,
+/// that settles to a persistent depth error of roughly 50 us. This is a
+/// deliberate trade, not an oversight — an integral term would drive the
+/// residual to zero, but at the cost of windup risk (the accumulated integral
+/// term overshooting) during outages, when depth error can spike and stay
+/// nonzero for a while. ~50 us is negligible against the 80 ms target depth, so
+/// the simpler proportional-only controller is used instead.
 pub struct DepthController {
     kp: f64,
     clamp: f64,
@@ -97,12 +110,15 @@ mod tests {
         let mut c = controller();
         let dt = 0.01;
         let mut elapsed = 0.0;
-        while c.update(100.0, dt) < 1.025 - 1e-9 {
+        loop {
             elapsed += dt;
+            if c.update(100.0, dt) >= 1.025 - 1e-9 {
+                break;
+            }
             assert!(elapsed < 20.0, "never reached clamp");
         }
         assert!(
-            (elapsed - 12.5).abs() < 0.05,
+            (elapsed - 12.5).abs() < 1e-6,
             "reached clamp in {} s, expected 12.5",
             elapsed
         );
