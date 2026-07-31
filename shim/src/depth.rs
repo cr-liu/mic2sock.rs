@@ -33,8 +33,19 @@ pub const WINDOW_MS: u64 = 30_000;
 pub const SHRINK_INTERVAL_MS: u64 = 10_000;
 
 impl DepthEstimator {
+    /// # Panics
+    ///
+    /// If `d_max_adaptive_ms` is below two packets. Two packets is the buffer's
+    /// structural floor, so a smaller ceiling would not be a ceiling: the
+    /// estimator would start above it. `Config::validate` refuses such a pair.
     pub fn new(d_max_adaptive_ms: u64, packet_ms: u64) -> Self {
         let packet_ms = packet_ms.max(1);
+        assert!(
+            d_max_adaptive_ms >= 2 * packet_ms,
+            "d_max_adaptive_ms {} is below the two-packet floor {}",
+            d_max_adaptive_ms,
+            2 * packet_ms
+        );
         DepthEstimator {
             d_max_adaptive_ms,
             packet_ms,
@@ -65,7 +76,27 @@ impl DepthEstimator {
     pub fn observe(&mut self, now_ms: u64, header_ms: u64, _reserved: u8) -> Arrival {
         let d = now_ms as i64 - header_ms as i64;
 
-        // Evict stale samples first so d_min reflects the current window.
+        // Monotonic time is a precondition. If it is violated the ordering the
+        // eviction loop depends on is gone, so discard the window rather than
+        // let un-evictable future-dated samples accumulate behind the front.
+        if matches!(self.samples.back(), Some(&(t, _)) if t > now_ms) {
+            self.samples.clear();
+        }
+
+        // The reference the classification is measured against must outlive
+        // eviction. When every sample has aged out, the newest of them is still
+        // the only evidence of what "on time" meant -- without it a packet
+        // delayed by a full second becomes its own minimum, reports
+        // `above_min_ms: 0`, and is filed as ordinary jitter. That was how an
+        // outage reached the statistic despite this module existing to keep it
+        // out: `observe(0, 0)` then `observe(30_001, 29_001)` evicted the
+        // baseline in the same call that needed it.
+        let stale_ref = self.samples.back().map(|&(_, d)| d);
+
+        // Evict stale samples so the statistic itself holds only fresh ones. A
+        // stale reference may still classify, but it must not contribute to the
+        // spread: over a long arrival gap it has drifted (50 ppm), and letting a
+        // drifted sample set `w` would inflate the target for nothing.
         while let Some(&(t, _)) = self.samples.front() {
             if now_ms.saturating_sub(t) > self.window_ms {
                 self.samples.pop_front();
@@ -74,7 +105,13 @@ impl DepthEstimator {
             }
         }
 
-        let d_min = self.samples.iter().map(|&(_, d)| d).min().unwrap_or(d);
+        let d_min = self
+            .samples
+            .iter()
+            .map(|&(_, d)| d)
+            .min()
+            .or(stale_ref)
+            .unwrap_or(d);
         let above = (d - d_min).max(0) as u64;
 
         if above > self.d_max_adaptive_ms {
@@ -123,7 +160,9 @@ impl DepthEstimator {
     }
 
     fn grow_to(&mut self, want: u64, now_ms: u64) {
-        let capped = want.min(self.d_max_adaptive_ms.max(2 * self.packet_ms));
+        // A genuine cap: `new` guarantees d_max_adaptive_ms is at or above the
+        // two-packet floor, so it never has to be raised to accommodate it.
+        let capped = want.min(self.d_max_adaptive_ms);
         if capped > self.target_ms {
             self.target_ms = capped;
             // Growth resets the shrink timer, so a burst cannot be immediately
@@ -194,6 +233,67 @@ mod tests {
             Arrival::Outage { above_min_ms: 1000 }
         );
         assert_eq!(e.target_ms(), before, "an outage inflated the target");
+    }
+
+    /// The same load-bearing behaviour, at the boundary that used to defeat it.
+    /// A stall lasting longer than the window evicts the baseline in the very
+    /// call that needs it; the late packet then became its own minimum, reported
+    /// `above_min_ms: 0`, and was filed as jitter. The next normal arrival made
+    /// the retained range 1000 ms and the target jumped to the 80 ms cap.
+    #[test]
+    fn an_outage_that_outlives_the_window_is_still_excluded() {
+        let mut e = est();
+        e.observe(0, 0, 0);
+        assert_eq!(e.target_ms(), 20);
+
+        assert_eq!(
+            e.observe(WINDOW_MS + 1, WINDOW_MS + 1 - 1000, 0),
+            Arrival::Outage { above_min_ms: 1000 },
+            "a 1 s delay was misclassified once its reference aged out"
+        );
+        assert_eq!(e.target_ms(), 20, "an outage inflated the target");
+
+        // The following normal arrival must not find the outage in the window.
+        e.observe(WINDOW_MS + 11, WINDOW_MS + 11, 0);
+        assert_eq!(e.target_ms(), 20, "the outage contaminated the window");
+    }
+
+    /// The stale reference classifies, but must not enter the statistic: over a
+    /// long arrival gap it has drifted, and a drifted sample setting `w` would
+    /// inflate the target with no jitter having occurred.
+    #[test]
+    fn a_stale_reference_does_not_inflate_the_spread() {
+        let mut e = est();
+        e.observe(0, 0, 0);
+        // 30 ms of accumulated drift after a long gap: within the threshold, so
+        // it is recorded -- but it is then the only sample, so the spread is 0.
+        let t = 10 * WINDOW_MS;
+        assert_eq!(
+            e.observe(t, t - 30, 0),
+            Arrival::Jitter { above_min_ms: 30 }
+        );
+        assert_eq!(e.sample_count(), 1, "the stale sample was kept");
+        assert_eq!(e.target_ms(), 20, "drift alone deepened the buffer");
+    }
+
+    /// Monotonic time is a precondition; if it is violated the window must not
+    /// silently stop evicting and grow without bound.
+    #[test]
+    fn time_going_backwards_discards_the_window_instead_of_wedging_it() {
+        let mut e = est();
+        e.observe(100_000, 100_000, 0);
+        e.observe(0, 0, 0);
+        assert_eq!(e.sample_count(), 1, "the future-dated sample was retained");
+        e.observe(WINDOW_MS + 1, WINDOW_MS + 1, 0);
+        assert_eq!(e.sample_count(), 1, "eviction stopped at a future sample");
+    }
+
+    /// Calling `d_max_adaptive_ms` a cap is only honest if the estimator cannot
+    /// start above it. Config validation refuses such a pair; so does this.
+    #[test]
+    #[should_panic(expected = "below the two-packet floor")]
+    fn a_ceiling_below_the_two_packet_floor_is_refused() {
+        DepthEstimator::new(5, 10);
     }
 
     #[test]
