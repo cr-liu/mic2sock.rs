@@ -21,7 +21,11 @@ impl Backoff {
     /// Panics if `base_ms > max_ms`, which is a configuration or programming
     /// error; this project's convention is to fail loudly on those rather than
     /// silently using `min(base_ms, max_ms)` as the real first-attempt ceiling.
+    /// Panics if `base_ms == 0`: the exponential ceiling would then stay zero
+    /// forever, making every delay zero -- a reconnect busy-loop, exactly the
+    /// failure this type exists to prevent.
     pub fn new(base_ms: u64, max_ms: u64, seed: u64) -> Self {
+        assert!(base_ms > 0, "base_ms must be > 0");
         assert!(base_ms <= max_ms, "base_ms must be <= max_ms");
         Backoff {
             base_ms,
@@ -73,6 +77,12 @@ mod tests {
     #[should_panic(expected = "base_ms must be <= max_ms")]
     fn base_greater_than_max_is_a_configuration_error() {
         Backoff::new(5000, 200, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "base_ms must be > 0")]
+    fn zero_base_is_a_configuration_error() {
+        Backoff::new(0, 200, 1);
     }
 
     #[test]
