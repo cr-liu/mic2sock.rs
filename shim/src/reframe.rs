@@ -16,6 +16,22 @@ use protocol::{Header, PacketLayout};
 /// warm-up at 16 kHz, not a per-packet loss: those samples come out as soon as
 /// more input arrives. It is identical across channels, so it cannot disturb
 /// inter-channel phase, which is the one property this module has to preserve.
+///
+/// Output timestamps are the shim's own continuous timeline: anchored to the
+/// earliest input packet that has contributed since the last frame, and extrapolated
+/// by one output packet duration when there is none, so that concealment and the
+/// drift-correcting `step` below 1.0 cannot put 1970 on the wire. Before the first
+/// real input packet there is nothing to anchor to and the timeline starts at zero —
+/// the pipeline should not be emitting audio it has never received.
+///
+/// The anchor is accurate **to within one packet**: output boundaries do not line up
+/// with input boundaries — that is the point of reframing — so the input packet whose
+/// audio actually begins an output packet may be the next one along. Sample-accurate
+/// timestamps would mean tracking the resampler's consumption back to a per-sample
+/// input position, and 10 ms is already the granularity the sender itself works at
+/// (its own timestamps carry a 10 ms fudge). What must not drift is *inter-channel*
+/// alignment, and that is unaffected: every channel is framed from the same
+/// boundary.
 pub struct Reframer {
     in_layout: PacketLayout,
     out_layout: PacketLayout,
@@ -27,8 +43,16 @@ pub struct Reframer {
     out_pkt_id: i32,
     /// Header of the first input packet contributing to the packet being built.
     pending_header: Option<Header>,
-    /// Linear fade multiplier applied on the way out and back in, 0.0..=1.0.
+    /// Timestamp for the next output packet, in milliseconds since the epoch, used
+    /// when no input header is available to anchor it. See `drain`.
+    next_out_ts_ms: u64,
+    /// Duration of one output packet in milliseconds, the step of that timeline.
+    out_packet_ms: u64,
+    /// Linear fade multiplier, 0.0..=1.0, and where it is heading.
     gain: f64,
+    gain_target: f64,
+    /// Change in gain per *sample*: the ramp is applied inside the packet, not to
+    /// the packet as a whole.
     gain_step: f64,
 }
 
@@ -52,9 +76,18 @@ impl Reframer {
             device_id,
             out_pkt_id: 0,
             pending_header: None,
+            next_out_ts_ms: 0,
+            out_packet_ms: (out_layout.spp as u64 * 1000 / sample_rate as u64).max(1),
             gain: 1.0,
+            gain_target: 1.0,
             gain_step: 1.0 / fade_samples as f64,
         }
+    }
+
+    /// Milliseconds since the epoch named by a header. `ms` is signed on the wire,
+    /// so this is computed in `i64` before being brought back.
+    fn header_ms(h: &Header) -> u64 {
+        (h.secs as i64 * 1000 + h.ms as i64).max(0) as u64
     }
 
     /// Feeds one input packet's audio into the resampler.
@@ -71,28 +104,40 @@ impl Reframer {
         }
     }
 
-    /// Feeds one input packet's worth of silence, and ramps the fade down.
+    /// Feeds one input packet's worth of silence, and aims the fade at zero.
     pub fn push_silence(&mut self) {
         let zeros = vec![0i16; self.in_layout.spp];
         for c in 0..self.in_layout.n_ch {
             self.resampler.push(c, &zeros);
         }
-        self.fade_towards(0.0);
+        self.gain_target = 0.0;
     }
 
-    /// Feeds real audio and ramps the fade back up.
+    /// Feeds real audio and aims the fade back at unity.
     pub fn push_audible(&mut self, packet: &[u8]) {
         self.push_packet(packet);
-        self.fade_towards(1.0);
+        self.gain_target = 1.0;
     }
 
-    fn fade_towards(&mut self, goal: f64) {
-        let span = self.in_layout.spp as f64 * self.gain_step;
-        if goal > self.gain {
-            self.gain = (self.gain + span).min(1.0);
-        } else if goal < self.gain {
-            self.gain = (self.gain - span).max(0.0);
+    /// The gain trajectory for the next `n` output samples, and where it ends.
+    ///
+    /// Computed once per output packet and applied to **every channel**, so the fade
+    /// cannot scale one channel differently from another. It also has to be
+    /// per-sample: a single multiplier for a whole packet turns a 20 ms fade into two
+    /// 10 ms steps of −6 dB, and a step in the waveform is the click the fade exists
+    /// to avoid.
+    fn ramp(&self, n: usize) -> (Vec<f64>, f64) {
+        let mut g = self.gain;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            if self.gain_target > g {
+                g = (g + self.gain_step).min(self.gain_target);
+            } else if self.gain_target < g {
+                g = (g - self.gain_step).max(self.gain_target);
+            }
+            out.push(g);
         }
+        (out, g)
     }
 
     /// Pulls resampled audio at `step` and appends every complete output packet
@@ -107,35 +152,45 @@ impl Reframer {
 
         while self.acc.iter().all(|a| a.len() >= self.out_layout.spp) {
             let mut buf = vec![0u8; self.out_layout.packet_len()];
-            let h = self.pending_header.take().unwrap_or(Header {
-                device_id: self.device_id,
-                secs: 0,
-                ms: 0,
-                pkt_id: 0,
-            });
-            // The timestamp of the first contributing input packet: header
-            // timestamps name the *start* of a packet's audio. The id is the
-            // shim's own sequence, so the consumer never sees a jump.
+            // Header timestamps name the *start* of a packet's audio, so an output
+            // packet is stamped with the first input packet that contributed to it.
+            // When there is none — during concealment, or when one drain frames two
+            // packets because `step` is below 1.0 and the accumulator has run ahead —
+            // the timeline is *extrapolated* rather than left at zero. Borrowing a
+            // zeroed header there put 1970 on every silence packet and on roughly
+            // every fortieth packet at the ordinary drift-correcting step.
+            let ts_ms = match self.pending_header.take() {
+                Some(h) => Self::header_ms(&h),
+                None => self.next_out_ts_ms,
+            };
+            self.next_out_ts_ms = ts_ms + self.out_packet_ms;
             Header {
                 device_id: self.device_id,
-                secs: h.secs,
-                ms: h.ms,
+                secs: (ts_ms / 1000) as u32,
+                ms: (ts_ms % 1000) as i16,
                 pkt_id: self.out_pkt_id,
             }
             .write_to(&mut buf);
 
+            let (ramp, gain_after) = if self.gain >= 1.0 && self.gain_target >= 1.0 {
+                (Vec::new(), self.gain)
+            } else {
+                self.ramp(self.out_layout.spp)
+            };
             for c in 0..self.out_layout.n_ch {
                 let taken: Vec<i16> = self.acc[c].drain(..self.out_layout.spp).collect();
-                let faded: Vec<i16> = if self.gain >= 1.0 {
+                let faded: Vec<i16> = if ramp.is_empty() {
                     taken
                 } else {
                     taken
                         .iter()
-                        .map(|&s| (s as f64 * self.gain).round() as i16)
+                        .zip(&ramp)
+                        .map(|(&s, &g)| (s as f64 * g).round() as i16)
                         .collect()
                 };
                 reblock_channel(&mut buf, &self.out_layout, c, &faded);
             }
+            self.gain = gain_after;
 
             self.out_pkt_id = if self.out_pkt_id == i32::MAX - 1 {
                 0
@@ -288,6 +343,186 @@ mod tests {
         let mut c = vec![0i16; lo.spp];
         deblock_channel(out.last().unwrap(), &lo, 0, &mut c);
         assert!(c.iter().all(|&s| s == 0), "silence packet was not silent");
+    }
+
+    /// Concealment must continue the timeline, not restart it at the epoch. Borrowing
+    /// a zeroed header put 1970 on every silence packet, and the consumer parses that
+    /// field.
+    #[test]
+    fn silence_packets_continue_the_timeline() {
+        let (li, lo) = layouts(160, 160);
+        let mut r = Reframer::new(li, lo, 5, 16000, 20);
+        let mut out = Vec::new();
+
+        // Input packets 10 ms apart, as the sender actually stamps them.
+        for k in 0..6i32 {
+            let mut buf = vec![0u8; li.packet_len()];
+            Header {
+                device_id: 5,
+                secs: 100,
+                ms: (k * 10) as i16,
+                pkt_id: k,
+            }
+            .write_to(&mut buf);
+            r.push_packet(&Bytes::from(buf));
+            r.drain(1.0, &mut out);
+        }
+        let real = out.len();
+        assert!(real >= 4);
+        for _ in 0..4 {
+            r.push_silence();
+            r.drain(1.0, &mut out);
+        }
+        assert!(out.len() > real, "no silence packet was produced");
+
+        let stamps: Vec<u64> = out
+            .iter()
+            .map(|p| {
+                let h = Header::parse(p).unwrap();
+                h.secs as u64 * 1000 + h.ms as u64
+            })
+            .collect();
+        // Nothing at the epoch, and the timeline never goes backwards.
+        for (i, w) in stamps.windows(2).enumerate() {
+            assert!(w[0] >= 100_000, "packet {} fell back to the epoch", i);
+            assert!(w[1] >= w[0], "timeline went backwards at packet {}", i + 1);
+        }
+        // The concealed tail has no input header to anchor to, so it must advance by
+        // exactly one output packet duration. That is the extrapolation under test.
+        for i in real..stamps.len() {
+            assert_eq!(
+                stamps[i],
+                stamps[i - 1] + 10,
+                "silence packet {} did not continue the timeline",
+                i
+            );
+        }
+    }
+
+    /// At a step below 1.0 — the ordinary drift correction, not an exceptional case —
+    /// the accumulator runs ahead and one drain eventually frames two packets. The
+    /// second has no input header to borrow, and used to be stamped 1970.
+    #[test]
+    fn two_packets_from_one_drain_both_get_real_timestamps() {
+        let (li, lo) = layouts(160, 160);
+        let mut r = Reframer::new(li, lo, 5, 16000, 20);
+        let mut out = Vec::new();
+        for k in 0..80 {
+            r.push_packet(&make_input(&li, k, 0));
+            r.drain(0.975, &mut out);
+        }
+        assert!(out.len() > 80, "the accumulator did not run ahead");
+        for (i, p) in out.iter().enumerate() {
+            let h = Header::parse(p).unwrap();
+            assert!(
+                h.secs >= 100,
+                "packet {} fell back to the epoch: secs {}",
+                i,
+                h.secs
+            );
+        }
+    }
+
+    /// A constant, non-zero signal on every channel, so that a change in a sample can
+    /// only have come from the gain.
+    fn flat_input(l: &PacketLayout, level: i16) -> Bytes {
+        let mut buf = vec![0u8; l.packet_len()];
+        Header {
+            device_id: 5,
+            secs: 100,
+            ms: 0,
+            pkt_id: 0,
+        }
+        .write_to(&mut buf);
+        for c in 0..l.n_ch {
+            reblock_channel(&mut buf, l, c, &vec![level; l.spp]);
+        }
+        Bytes::from(buf)
+    }
+
+    /// The fade has to be a ramp *within* the packet. A single multiplier per packet
+    /// makes a 20 ms fade two 10 ms steps of −6 dB, and a step in the waveform is the
+    /// click the fade exists to prevent.
+    ///
+    /// Measured on the fade *in*, and one packet after the audio resumes. On the way
+    /// out the signal is heading for zero anyway, so a flat multiplier and a ramp are
+    /// indistinguishable there — the first version of this test passed on three
+    /// trailing zeros rather than on the gain.
+    #[test]
+    fn the_fade_ramps_within_a_packet_and_across_channels_alike() {
+        let (li, lo) = layouts(160, 160);
+        // A 200 ms fade, so the ramp spans twenty packets: at the configured 20 ms it
+        // is over in two, which leaves no packet where the audio has fully resumed and
+        // the gain is still moving.
+        let mut r = Reframer::new(li, lo, 5, 16000, 200);
+        let mut out = Vec::new();
+        let flat = flat_input(&li, 10_000);
+
+        // All the way down first, so the ramp back up runs over real audio.
+        for _ in 0..25 {
+            r.push_silence();
+            r.drain(1.0, &mut out);
+        }
+        for _ in 0..2 {
+            r.push_audible(&flat);
+            r.drain(1.0, &mut out);
+        }
+        let before = out.len();
+        r.push_audible(&flat);
+        r.drain(1.0, &mut out);
+        assert!(out.len() > before, "no packet was produced for the fade");
+
+        let mut c0 = vec![0i16; lo.spp];
+        let mut c1 = vec![0i16; lo.spp];
+        deblock_channel(&out[before], &lo, 0, &mut c0);
+        deblock_channel(&out[before], &lo, 1, &mut c1);
+        assert!(
+            c0.iter().all(|&s| s > 0),
+            "the audio had not resumed in this packet: {:?}",
+            &c0[..8]
+        );
+        assert!(
+            c0[lo.spp - 1] > c0[0],
+            "the gain did not move within the packet: {} .. {}",
+            c0[0],
+            c0[lo.spp - 1]
+        );
+        assert!(
+            c0.windows(2).all(|w| w[1] >= w[0]),
+            "the ramp is not monotonic"
+        );
+        // And identical on every channel: a fade that scaled channels differently
+        // would break exactly what the reframer exists to preserve.
+        assert_eq!(c0, c1, "the fade scaled two channels differently");
+    }
+
+    /// Entering an outage reaches true silence, and does not get there in one step.
+    #[test]
+    fn a_fade_out_reaches_silence_without_jumping_there() {
+        let (li, lo) = layouts(160, 160);
+        // 20 ms at 16 kHz is 320 samples: two 160-sample packets.
+        let mut r = Reframer::new(li, lo, 5, 16000, 20);
+        let mut out = Vec::new();
+        let flat = flat_input(&li, 10_000);
+        for _ in 0..6 {
+            r.push_audible(&flat);
+            r.drain(1.0, &mut out);
+        }
+        let before = out.len();
+        for _ in 0..4 {
+            r.push_silence();
+            r.drain(1.0, &mut out);
+        }
+        let mut c = vec![0i16; lo.spp];
+        // Still audible where the fade begins, fully out a couple of packets later.
+        deblock_channel(&out[before], &lo, 0, &mut c);
+        assert!(c[0] != 0, "the fade was instant");
+        deblock_channel(&out[before + 2], &lo, 0, &mut c);
+        assert!(
+            c.iter().all(|&s| s == 0),
+            "silence was never reached: {:?}",
+            &c[..8]
+        );
     }
 
     /// A step above 1 consumes input faster than it produces output, which is
