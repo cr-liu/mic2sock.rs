@@ -76,14 +76,26 @@ mod tests {
         }
     }
 
-    /// For monotonic input the result must stay between the two inner samples.
+    /// For a **linear** ramp the result must stay between the two inner samples.
+    /// This is not a general monotonicity guarantee -- see
+    /// `overshoots_on_nonlinear_monotonic_input` below.
     #[test]
-    fn stays_between_inner_samples_for_monotonic_input() {
+    fn linear_input_stays_between_inner_samples() {
         for i in 0..=10 {
             let x = i as f64 / 10.0;
             let y = interpolate(0.0, 10.0, 20.0, 30.0, x);
             assert!((10.0..=20.0).contains(&y), "x={} y={}", x, y);
         }
+    }
+
+    /// Catmull-Rom is not monotonicity preserving in general -- it overshoots on a
+    /// non-linear monotonic window. Pinned here so the linear-only test above is not
+    /// mistaken for a general guarantee.
+    #[test]
+    fn overshoots_on_nonlinear_monotonic_input() {
+        let y = interpolate(0.0, 1.0, 1.0, 1.0, 0.25);
+        assert!(y > 1.0, "expected overshoot above 1.0, got {}", y);
+        assert!(y < 1.1, "overshoot larger than expected: {}", y);
     }
 
     /// Translation invariance is what `Resampler` depends on: two channels carrying

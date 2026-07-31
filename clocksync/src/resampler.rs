@@ -53,6 +53,11 @@ const ONE: u64 = 1 << FRAC_BITS;
 /// samples than their siblings, silently desynchronizing them.
 const MAX_STEP: f64 = 16.0;
 
+/// Smallest accepted `step`, for the same reason as `MAX_STEP`: `step` values
+/// near zero produce enormous output per input sample. The controller stays
+/// within 0.975..=1.025, so this bound is far looser than production needs.
+const MIN_STEP: f64 = 1.0 / 16.0;
+
 impl Resampler {
     pub fn new(n_ch: usize) -> Self {
         Resampler {
@@ -95,8 +100,8 @@ impl Resampler {
     ///
     /// # Panics
     /// Panics if `out.len() != n_ch`, if `step` is not finite or not in
-    /// `(0, MAX_STEP]`, or if `step` is so small it rounds to zero in Q32 and so
-    /// could never advance the phase.
+    /// `[MIN_STEP, MAX_STEP]`, or if `step` rounds to zero in Q32 (unreachable
+    /// once the `MIN_STEP` bound holds; kept as a belt-and-braces check).
     pub fn pull(&mut self, step: f64, want: usize, out: &mut [Vec<i16>]) -> usize {
         assert_eq!(
             out.len(),
@@ -104,8 +109,9 @@ impl Resampler {
             "out must have one Vec per channel"
         );
         assert!(
-            step.is_finite() && step > 0.0 && step <= MAX_STEP,
-            "step must be finite and in (0, {}], got {}",
+            step.is_finite() && (MIN_STEP..=MAX_STEP).contains(&step),
+            "step must be finite and in [{}, {}], got {}",
+            MIN_STEP,
             MAX_STEP,
             step
         );
@@ -120,9 +126,22 @@ impl Resampler {
 
         let mut produced = 0;
         while produced < want {
-            if self.pending() < TAPS {
+            let pending = self.pending();
+            if pending < TAPS {
                 break;
             }
+            // Work out this iteration's consumption before emitting, so we can refuse
+            // to emit at all unless every channel can supply it. Popping a different
+            // number of samples per channel would desynchronize them permanently,
+            // which is the one failure this crate exists to prevent -- and
+            // `pop_front()` on an exhausted deque silently returns None, so an
+            // unguarded pop loop does exactly that.
+            let next_phase = self.phase + step_q;
+            let advance = (next_phase >> FRAC_BITS) as usize;
+            if pending < advance {
+                break;
+            }
+
             // The invariant: one phase value, applied to every channel this
             // iteration.
             let x = self.phase as f64 / ONE as f64;
@@ -137,14 +156,10 @@ impl Resampler {
                 out[ch].push(to_i16(y));
             }
 
-            self.phase += step_q;
-            let advance = (self.phase >> FRAC_BITS) as usize;
-            self.phase &= ONE - 1;
-            if advance > 0 {
-                for buf in self.bufs.iter_mut() {
-                    for _ in 0..advance {
-                        buf.pop_front();
-                    }
+            self.phase = next_phase & (ONE - 1);
+            for buf in self.bufs.iter_mut() {
+                for _ in 0..advance {
+                    buf.pop_front();
                 }
             }
             produced += 1;
@@ -154,6 +169,15 @@ impl Resampler {
 }
 
 #[cfg(test)]
+// Several tests below walk a shared index `k` across multiple per-channel
+// `Vec`s (`out[0][k]`, `out[1][k]`, ...) to check they agree sample-for-sample.
+// clippy's needless_range_loop rewrite would `enumerate()` over a *single*
+// channel's Vec, which compares the wrong data for every other channel, so the
+// lint is silenced for the whole module rather than followed. This also covers
+// `shared_phase_preserves_inter_channel_delay_exactly`, which must stay
+// byte-for-byte unmodified (see review notes), so the allow could not be
+// placed on that function itself.
+#[allow(clippy::needless_range_loop)]
 mod tests {
     use super::*;
 
@@ -323,5 +347,69 @@ mod tests {
         r.push(0, &[0i16; 100]);
         let mut out = vec![Vec::new()];
         r.pull(f64::INFINITY, 5, &mut out);
+    }
+
+    #[test]
+    #[should_panic(expected = "step must be finite")]
+    fn rejects_step_below_min() {
+        let mut r = Resampler::new(1);
+        r.push(0, &[0i16; 100]);
+        let mut out = vec![Vec::new()];
+        // 2^-33 rounds to step_q = 1 (still nonzero) but is far below MIN_STEP;
+        // without a floor this would emit up to 2^32 output samples per input tap.
+        r.pull(2.0f64.powi(-33), 5, &mut out);
+    }
+
+    /// Regression for a real desync: a channel holding fewer samples than the phase
+    /// advance must not pop fewer than its siblings. Before this guard, feeding two
+    /// channels the *same* ramp left their outputs 12 samples apart.
+    #[test]
+    fn unequal_buffer_depth_never_desynchronizes_channels() {
+        let mut r = Resampler::new(2);
+        r.push(0, &[0, 1, 2, 3]);
+        r.push(1, &(0..20).collect::<Vec<i16>>());
+
+        let mut out = vec![Vec::new(), Vec::new()];
+        // ch0 cannot supply a 16-sample advance, so nothing may be emitted.
+        assert_eq!(r.pull(16.0, 1, &mut out), 0);
+        assert!(out[0].is_empty() && out[1].is_empty());
+
+        // Once ch0 catches up, both channels carry the same ramp, so every output
+        // sample must match exactly.
+        r.push(0, &(4..20).collect::<Vec<i16>>());
+        let mut out2 = vec![Vec::new(), Vec::new()];
+        let n = r.pull(1.0, 8, &mut out2);
+        assert!(
+            n > 0,
+            "made no progress after the lagging channel caught up"
+        );
+        for k in 0..out2[0].len() {
+            assert_eq!(
+                out2[0][k], out2[1][k],
+                "channels desynchronized at output {}",
+                k
+            );
+        }
+    }
+
+    /// A large step must not consume unequally even when buffers are ample but
+    /// unequal.
+    #[test]
+    fn large_step_consumes_every_channel_equally() {
+        let mut r = Resampler::new(3);
+        r.push(0, &(0..100).collect::<Vec<i16>>());
+        r.push(1, &(0..100).collect::<Vec<i16>>());
+        r.push(2, &(0..60).collect::<Vec<i16>>());
+
+        let mut out: Vec<Vec<i16>> = (0..3).map(|_| Vec::new()).collect();
+        r.pull(8.0, 20, &mut out);
+
+        // All three carry the identical ramp, so all outputs must agree.
+        for k in 0..out[0].len() {
+            assert_eq!(out[0][k], out[1][k], "ch0 vs ch1 at {}", k);
+            assert_eq!(out[0][k], out[2][k], "ch0 vs ch2 at {}", k);
+        }
+        // And the shortest channel must not have been over-drained.
+        assert!(r.pending() > 0 || !out[0].is_empty());
     }
 }

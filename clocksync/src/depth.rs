@@ -37,10 +37,17 @@ impl DepthController {
     ///   0.002).
     ///
     /// # Panics
-    /// Panics if `clamp` is not in `(0, 1)` or `slew_per_sec` is not positive.
+    /// Panics if `clamp` is not in `(0, 1)`, if `slew_per_sec` is not positive, or
+    /// if `kp` is not finite and non-negative (a negative `kp` reverses feedback;
+    /// a NaN `kp` would silently poison `step` forever).
     pub fn new(kp: f64, clamp: f64, slew_per_sec: f64) -> Self {
         assert!(clamp > 0.0 && clamp < 1.0, "clamp must be in (0, 1)");
         assert!(slew_per_sec > 0.0, "slew_per_sec must be positive");
+        assert!(
+            kp.is_finite() && kp >= 0.0,
+            "kp must be finite and non-negative, got {}",
+            kp
+        );
         DepthController {
             kp,
             clamp,
@@ -59,7 +66,22 @@ impl DepthController {
     /// * `dt_secs` — elapsed time since the last call.
     ///
     /// Returns the new `step`, ready to hand to `Resampler::pull`.
+    ///
+    /// # Panics
+    /// Panics if `error_secs` is not finite, or if `dt_secs` is not finite or is
+    /// negative (a negative `dt_secs` would make `max_delta` negative, which
+    /// panics in the `clamp` call below since `clamp` requires `min <= max`).
     pub fn update(&mut self, error_secs: f64, dt_secs: f64) -> f64 {
+        assert!(
+            error_secs.is_finite(),
+            "error_secs must be finite, got {}",
+            error_secs
+        );
+        assert!(
+            dt_secs.is_finite() && dt_secs >= 0.0,
+            "dt_secs must be finite and non-negative, got {}",
+            dt_secs
+        );
         let target = 1.0 + (self.kp * error_secs).clamp(-self.clamp, self.clamp);
         let max_delta = self.slew_per_sec * dt_secs;
         let delta = (target - self.step).clamp(-max_delta, max_delta);
@@ -163,5 +185,37 @@ mod tests {
         let mut c = DepthController::new(0.01, 0.025, 1.0);
         let s = c.update(0.05, 1.0);
         assert!((s - 1.0005).abs() < 1e-9, "got {}", s);
+    }
+
+    /// A negative `kp` would reverse feedback direction instead of correcting it.
+    #[test]
+    #[should_panic(expected = "kp must be finite and non-negative")]
+    fn rejects_negative_kp() {
+        DepthController::new(-1.0, 0.025, 0.002);
+    }
+
+    /// A NaN `kp` would silently poison every future `step` with NaN.
+    #[test]
+    #[should_panic(expected = "kp must be finite and non-negative")]
+    fn rejects_nan_kp() {
+        DepthController::new(f64::NAN, 0.025, 0.002);
+    }
+
+    /// A NaN `error_secs` would poison `step` with NaN forever.
+    #[test]
+    #[should_panic(expected = "error_secs must be finite")]
+    fn rejects_nan_error_secs() {
+        let mut c = controller();
+        c.update(f64::NAN, 0.1);
+    }
+
+    /// A negative `dt_secs` makes `max_delta` negative, which panics inside
+    /// `clamp` (`min > max`) rather than failing with a clear message -- reject
+    /// it up front instead.
+    #[test]
+    #[should_panic(expected = "dt_secs must be finite and non-negative")]
+    fn rejects_negative_dt_secs() {
+        let mut c = controller();
+        c.update(0.0, -0.1);
     }
 }
