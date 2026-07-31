@@ -3,6 +3,7 @@
 //! rather than a process.
 
 pub mod config;
+pub mod depth;
 pub mod metrics;
 
 pub use config::Config;
