@@ -1,0 +1,183 @@
+/// Counters and an arrival-delay histogram, flushed periodically as JSONL.
+///
+/// The histogram of `d = arrival - header timestamp` is the whole point: its
+/// p99.9 is the answer to "how low can this link actually go", and it is the
+/// instrument for judging whether the later ALSA rewrite helped or hurt.
+///
+/// Time is injected rather than read from a clock so this is testable.
+#[derive(Debug, Default)]
+pub struct Metrics {
+    /// Histogram of `d - d_min` in milliseconds, one bucket per ms up to
+    /// `BUCKETS - 1`, with the last bucket collecting everything beyond.
+    buckets: Vec<u64>,
+    pub arrivals: u64,
+    pub conceal_events: u64,
+    pub conceal_samples: u64,
+    pub outage_events: u64,
+    pub resync_events: u64,
+    pub late_discards: u64,
+    pub duplicate_discards: u64,
+    /// Should stay 0. Non-zero means the backlog exceeded `catchup_max` and the
+    /// lossless promise has begun to degrade.
+    pub catchup_overflow: u64,
+    /// Should stay 0. Non-zero means the consumer stopped reading.
+    pub max_depth_hit: u64,
+    last_flush_ms: u64,
+}
+
+pub const BUCKETS: usize = 512;
+
+impl Metrics {
+    pub fn new() -> Self {
+        Metrics {
+            buckets: vec![0; BUCKETS],
+            ..Default::default()
+        }
+    }
+
+    /// Records one arrival whose delay above the running minimum was `ms`.
+    pub fn record_delay(&mut self, ms: u64) {
+        self.arrivals += 1;
+        let i = (ms as usize).min(BUCKETS - 1);
+        self.buckets[i] += 1;
+    }
+
+    pub fn bucket(&self, i: usize) -> u64 {
+        self.buckets[i]
+    }
+
+    /// The smallest millisecond bound covering `pct` percent of arrivals.
+    pub fn percentile_ms(&self, pct: f64) -> u64 {
+        let total: u64 = self.buckets.iter().sum();
+        if total == 0 {
+            return 0;
+        }
+        // ceil, so p100 needs the whole population rather than total-epsilon.
+        let want = ((total as f64) * pct / 100.0).ceil() as u64;
+        let mut seen = 0;
+        for (i, n) in self.buckets.iter().enumerate() {
+            seen += n;
+            if seen >= want {
+                return i as u64;
+            }
+        }
+        (BUCKETS - 1) as u64
+    }
+
+    pub fn set_last_flush(&mut self, now_ms: u64) {
+        self.last_flush_ms = now_ms;
+    }
+
+    pub fn flush_due(&self, now_ms: u64, interval_ms: u64) -> bool {
+        now_ms.saturating_sub(self.last_flush_ms) >= interval_ms
+    }
+
+    /// Serialises one JSONL record. Hand-rolled rather than pulling in
+    /// serde_json: the shape is fixed and tiny.
+    pub fn to_json_line(&self, now_ms: u64, d_target_ms: u64, step: f64) -> String {
+        format!(
+            concat!(
+                "{{\"t_ms\":{},\"arrivals\":{},\"conceal_events\":{},",
+                "\"conceal_samples\":{},\"outage_events\":{},\"resync_events\":{},",
+                "\"late_discards\":{},\"duplicate_discards\":{},",
+                "\"catchup_overflow\":{},\"max_depth_hit\":{},",
+                "\"d_target_ms\":{},\"step\":{:.9},",
+                "\"p50_ms\":{},\"p99_ms\":{},\"p99_9_ms\":{}}}"
+            ),
+            now_ms,
+            self.arrivals,
+            self.conceal_events,
+            self.conceal_samples,
+            self.outage_events,
+            self.resync_events,
+            self.late_discards,
+            self.duplicate_discards,
+            self.catchup_overflow,
+            self.max_depth_hit,
+            d_target_ms,
+            step,
+            self.percentile_ms(50.0),
+            self.percentile_ms(99.0),
+            self.percentile_ms(99.9),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_into_per_millisecond_buckets() {
+        let mut m = Metrics::new();
+        m.record_delay(0);
+        m.record_delay(0);
+        m.record_delay(7);
+        assert_eq!(m.arrivals, 3);
+        assert_eq!(m.bucket(0), 2);
+        assert_eq!(m.bucket(7), 1);
+        assert_eq!(m.bucket(1), 0);
+    }
+
+    #[test]
+    fn delays_beyond_range_land_in_the_last_bucket() {
+        let mut m = Metrics::new();
+        m.record_delay(100_000);
+        assert_eq!(m.bucket(BUCKETS - 1), 1);
+    }
+
+    /// The percentile is the headline number, so it must be right at the edges.
+    #[test]
+    fn percentile_of_a_known_distribution() {
+        let mut m = Metrics::new();
+        for _ in 0..990 {
+            m.record_delay(5);
+        }
+        for _ in 0..10 {
+            m.record_delay(200);
+        }
+        assert_eq!(m.percentile_ms(50.0), 5);
+        assert_eq!(m.percentile_ms(99.0), 5);
+        assert_eq!(m.percentile_ms(99.9), 200);
+        assert_eq!(m.percentile_ms(100.0), 200);
+    }
+
+    #[test]
+    fn percentile_of_empty_histogram_is_zero() {
+        assert_eq!(Metrics::new().percentile_ms(99.9), 0);
+    }
+
+    #[test]
+    fn flush_is_due_only_after_the_interval() {
+        let mut m = Metrics::new();
+        m.set_last_flush(1_000);
+        assert!(!m.flush_due(1_000 + 59_999, 60_000));
+        assert!(m.flush_due(1_000 + 60_000, 60_000));
+    }
+
+    /// The JSONL line must be machine-readable and carry the alarm counters, so
+    /// a non-zero value is visible without reading prose logs.
+    #[test]
+    fn json_line_contains_the_alarm_counters_and_percentiles() {
+        let mut m = Metrics::new();
+        m.record_delay(3);
+        m.catchup_overflow = 2;
+        m.max_depth_hit = 1;
+        let line = m.to_json_line(12_345, 80, 1.0005);
+        assert!(
+            line.starts_with('{') && line.ends_with('}'),
+            "not a JSON object: {}",
+            line
+        );
+        for needle in [
+            "\"t_ms\":12345",
+            "\"arrivals\":1",
+            "\"catchup_overflow\":2",
+            "\"max_depth_hit\":1",
+            "\"d_target_ms\":80",
+            "\"p99_9_ms\":3",
+        ] {
+            assert!(line.contains(needle), "missing {} in {}", needle, line);
+        }
+    }
+}
