@@ -49,7 +49,34 @@ pub const EXIT_GEOMETRY: i32 = 4;
 /// Exit code used when the sink port cannot be bound.
 pub const EXIT_BIND: i32 = 3;
 
+/// The binary's entry point: binds the sink port from the config, and exits the
+/// process if it cannot.
 pub async fn run(cfg: Config) {
+    let out_layout = cfg.layout();
+    let sink = match Sink::bind(
+        &format!("127.0.0.1:{}", cfg.sink_port),
+        3,
+        out_layout.packet_len(),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("shim: cannot bind localhost:{}: {}", cfg.sink_port, e);
+            std::process::exit(EXIT_BIND);
+        }
+    };
+    run_with_sink(cfg, sink).await
+}
+
+/// Runs against an already-bound sink.
+///
+/// Split out so a test can bind port 0 itself, read back the assigned port, and pass
+/// the listener in. Taking a port *number* instead would leave a window between
+/// finding a free port and binding it — with several tests in one binary that is a
+/// real race, not a theoretical one — and would also mean a test process could be
+/// killed by this module's `exit` on a bind failure.
+pub async fn run_with_sink(cfg: Config, sink: Sink) {
     // The input geometry matches the output for now: the Pi's sample_per_packet is
     // only reduced in a later phase, and the reframer does not require the two to
     // divide each other.
@@ -73,20 +100,6 @@ pub async fn run(cfg: Config) {
             std::process::exit(EXIT_GEOMETRY);
         }
     });
-
-    let sink = match Sink::bind(
-        &format!("127.0.0.1:{}", cfg.sink_port),
-        3,
-        out_layout.packet_len(),
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("shim: cannot bind localhost:{}: {}", cfg.sink_port, e);
-            std::process::exit(EXIT_BIND);
-        }
-    };
     tokio::spawn(sink.run(sink_rx));
 
     let packet_ms = cfg.packet_ms();
