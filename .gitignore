@@ -2,3 +2,8 @@
 !.gitignore
 /target
 libjack.0.dylib
+
+# Deliberately untracked (see 0d5f9b7). Listed here rather than only in
+# .git/info/exclude so a `git add -A` on a fresh clone cannot sweep them back in.
+CLAUDE.md
+docs/superpowers/
