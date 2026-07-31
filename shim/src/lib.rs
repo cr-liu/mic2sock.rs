@@ -7,6 +7,7 @@ pub mod depth;
 pub mod jitter;
 pub mod metrics;
 pub mod reframe;
+pub mod source;
 
 pub use config::Config;
 
