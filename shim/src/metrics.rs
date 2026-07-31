@@ -5,7 +5,7 @@
 /// instrument for judging whether the later ALSA rewrite helped or hurt.
 ///
 /// Time is injected rather than read from a clock so this is testable.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Metrics {
     /// Histogram of `d - d_min` in milliseconds, one bucket per ms up to
     /// `BUCKETS - 1`, with the last bucket collecting everything beyond.
@@ -27,12 +27,30 @@ pub struct Metrics {
 
 pub const BUCKETS: usize = 512;
 
-impl Metrics {
-    pub fn new() -> Self {
+/// Spelled out rather than derived: a derived `Default` leaves `buckets` empty,
+/// and the first `record_delay` on such a value panics. `new()` is now the same
+/// constructor, so the two cannot drift apart.
+impl Default for Metrics {
+    fn default() -> Self {
         Metrics {
             buckets: vec![0; BUCKETS],
-            ..Default::default()
+            arrivals: 0,
+            conceal_events: 0,
+            conceal_samples: 0,
+            outage_events: 0,
+            resync_events: 0,
+            late_discards: 0,
+            duplicate_discards: 0,
+            catchup_overflow: 0,
+            max_depth_hit: 0,
+            last_flush_ms: 0,
         }
+    }
+}
+
+impl Metrics {
+    pub fn new() -> Self {
+        Metrics::default()
     }
 
     /// Records one arrival whose delay above the running minimum was `ms`.
@@ -46,14 +64,29 @@ impl Metrics {
         self.buckets[i]
     }
 
-    /// The smallest millisecond bound covering `pct` percent of arrivals.
+    /// The smallest millisecond bound covering `pct` percent of arrivals. An
+    /// empty histogram reports 0, which is indistinguishable from a real 0 ms
+    /// measurement — read it together with `arrivals`.
+    ///
+    /// # Panics
+    ///
+    /// If `pct` is outside `(0, 100]`. Outside that range the answer is not a
+    /// percentile: p0 returned bucket 0 whether or not anything was measured
+    /// there, and p101 returned the last bucket.
     pub fn percentile_ms(&self, pct: f64) -> u64 {
+        assert!(
+            pct > 0.0 && pct <= 100.0,
+            "percentile must be in (0, 100], got {}",
+            pct
+        );
         let total: u64 = self.buckets.iter().sum();
         if total == 0 {
             return 0;
         }
         // ceil, so p100 needs the whole population rather than total-epsilon.
-        let want = ((total as f64) * pct / 100.0).ceil() as u64;
+        // At least one sample must be covered, or the first bucket wins by
+        // default however empty it is.
+        let want = (((total as f64) * pct / 100.0).ceil() as u64).max(1);
         let mut seen = 0;
         for (i, n) in self.buckets.iter().enumerate() {
             seen += n;
@@ -74,14 +107,23 @@ impl Metrics {
 
     /// Serialises one JSONL record. Hand-rolled rather than pulling in
     /// serde_json: the shape is fixed and tiny.
+    ///
+    /// A non-finite `step` is emitted as `null`. JSON has no NaN or Infinity
+    /// literal, so `{:.9}` on one produced a line — the whole point of which is
+    /// to be machine-readable — that no parser would accept.
     pub fn to_json_line(&self, now_ms: u64, d_target_ms: u64, step: f64) -> String {
+        let step = if step.is_finite() {
+            format!("{:.9}", step)
+        } else {
+            "null".to_string()
+        };
         format!(
             concat!(
                 "{{\"t_ms\":{},\"arrivals\":{},\"conceal_events\":{},",
                 "\"conceal_samples\":{},\"outage_events\":{},\"resync_events\":{},",
                 "\"late_discards\":{},\"duplicate_discards\":{},",
                 "\"catchup_overflow\":{},\"max_depth_hit\":{},",
-                "\"d_target_ms\":{},\"step\":{:.9},",
+                "\"d_target_ms\":{},\"step\":{},",
                 "\"p50_ms\":{},\"p99_ms\":{},\"p99_9_ms\":{}}}"
             ),
             now_ms,
@@ -145,6 +187,47 @@ mod tests {
     #[test]
     fn percentile_of_empty_histogram_is_zero() {
         assert_eq!(Metrics::new().percentile_ms(99.9), 0);
+    }
+
+    /// A single sample must not be reported as 0 ms. `want` used to round down to
+    /// zero, and the first bucket then satisfied `seen >= 0` however empty it was.
+    #[test]
+    fn a_lone_sample_is_its_own_percentile() {
+        let mut m = Metrics::new();
+        m.record_delay(5);
+        assert_eq!(m.percentile_ms(1.0), 5);
+        assert_eq!(m.percentile_ms(50.0), 5);
+        assert_eq!(m.percentile_ms(100.0), 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "percentile must be in (0, 100]")]
+    fn a_percentile_outside_the_range_is_refused() {
+        Metrics::new().percentile_ms(101.0);
+    }
+
+    /// The derived Default left `buckets` empty, so the public constructor built
+    /// an object that panicked on its first use. Every test used `new()`, which
+    /// hid it.
+    #[test]
+    fn the_default_value_is_usable() {
+        let mut m = Metrics::default();
+        m.record_delay(0);
+        assert_eq!(m.arrivals, 1);
+    }
+
+    /// JSON has no NaN or Infinity literal. `{:.9}` on one produced a line that
+    /// no parser accepts, which defeats the only purpose of the format.
+    #[test]
+    fn a_non_finite_step_is_emitted_as_null() {
+        let m = Metrics::new();
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let line = m.to_json_line(1, 80, bad);
+            assert!(line.contains("\"step\":null"), "{}", line);
+            for literal in ["NaN", "nan", "inf", "Inf"] {
+                assert!(!line.contains(literal), "{} leaked into {}", literal, line);
+            }
+        }
     }
 
     #[test]
