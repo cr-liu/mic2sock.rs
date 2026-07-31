@@ -183,14 +183,22 @@ impl DepthEstimator {
         }
     }
 
-    /// The source connection was re-established.
+    /// The sender's packet id sequence restarted, which proves a new process and so a
+    /// possibly new clock offset. The old statistic describes the old offset, so it
+    /// goes.
     ///
-    /// A sender restart brings a new clock offset, and the old statistic describes
-    /// the old one. Expiry alone would get there eventually, but only after minutes
-    /// of classifying every arrival as an outage; a reconnect is direct evidence, so
-    /// it re-baselines immediately. It stays a backstop for the offset changes that
-    /// arrive without one — NTP stepping the sender's clock mid-stream.
-    pub fn on_source_reconnect(&mut self) {
+    /// **Not** a transport reconnect. `TcpSource` reconnects after any EOF, read
+    /// timeout or network blip, while the sender's process, ids and clock carry on —
+    /// and discarding the statistic there is actively harmful: the first packet after
+    /// the stall is the *most* delayed one, and with no reference to measure it
+    /// against it becomes its own baseline and is filed as ordinary jitter. That is
+    /// exactly the defect this module exists to prevent. The pipeline calls this only
+    /// when `JitterBuffer::generation_resets` has increased, which is a proven id
+    /// reset rather than a suspicion of one.
+    ///
+    /// [`REF_EXPIRY_MS`] remains the backstop for an offset change with no id reset
+    /// behind it — NTP stepping the sender's clock mid-stream.
+    pub fn on_generation_reset(&mut self) {
         self.samples.clear();
         self.ref_ms = None;
     }
@@ -480,11 +488,11 @@ mod tests {
         );
     }
 
-    /// A reconnect is direct evidence of a possible new clock offset, so it
-    /// re-baselines at once instead of waiting out the expiry while calling every
-    /// arrival an outage.
+    /// A proven id reset means a new sender process and so possibly a new clock
+    /// offset, which re-baselines at once instead of waiting out the expiry while
+    /// calling every arrival an outage.
     #[test]
-    fn a_reconnect_re_baselines_the_reference() {
+    fn a_generation_reset_re_baselines_the_reference() {
         let mut e = est();
         e.observe(1000, 1000, 0);
         assert!(matches!(
@@ -492,13 +500,81 @@ mod tests {
             Arrival::Outage { above_min_ms: 500 }
         ));
 
-        e.on_source_reconnect();
+        e.on_generation_reset();
         assert_eq!(
             e.observe(1020, 520, 0),
             Arrival::Jitter { above_min_ms: 0 },
-            "a reconnect did not re-baseline"
+            "a generation reset did not re-baseline"
         );
         assert_eq!(e.target_ms(), 20);
+    }
+
+    /// The trigger must be an id reset and not a transport reconnect. `TcpSource`
+    /// reconnects after any blip while the sender's clock carries on, and the first
+    /// packet after the stall is the most delayed one: with the reference thrown away
+    /// it becomes its own baseline and is filed as ordinary jitter, which is the very
+    /// defect this module exists to prevent.
+    #[test]
+    fn an_ordinary_stall_keeps_the_reference_that_measures_it() {
+        let mut e = est();
+        e.observe(1000, 950, 0); // d = 50
+                                 // One second of stall, then the backlog arrives: same sender, same clock.
+        assert_eq!(
+            e.observe(2000, 950, 0),
+            Arrival::Outage { above_min_ms: 1000 },
+            "the stalled packet was admitted as jitter"
+        );
+        assert_eq!(e.target_ms(), 20);
+    }
+
+    /// The live window's minimum has to become the durable reference, or the value
+    /// used after the window empties lags behind the drift the window tracked.
+    #[test]
+    fn the_live_window_minimum_becomes_the_durable_reference() {
+        let mut e = est();
+        // A rising staircase: each sample is 10 ms later than the last, so the
+        // window's minimum climbs as the early samples age out.
+        for k in 0..6u64 {
+            e.observe(k * 10_000, k * 10_000 - k * 10, 0);
+        }
+        // By the last of those the window held delays 20..50, so the durable
+        // reference is 20 rather than the original 0. A delay of 95 is then 75 above
+        // it — jitter — where against a reference stuck at 0 it would be an outage.
+        let t = 80_001;
+        assert_eq!(
+            e.observe(t, t - 95, 0),
+            Arrival::Jitter { above_min_ms: 75 },
+            "the durable reference lagged the window's minimum"
+        );
+    }
+
+    /// Accepted samples are what wind the expiry clock. Without that, the reference
+    /// expires a fixed interval after the *first* sample however long traffic has
+    /// been flowing, and a later stall re-baselines on itself.
+    #[test]
+    fn accepted_samples_wind_the_expiry_clock() {
+        let mut e = est();
+        e.observe(0, 0, 0);
+        e.observe(100_000, 100_000, 0);
+        assert_eq!(
+            e.observe(300_001, 300_001 - 500, 0),
+            Arrival::Outage { above_min_ms: 500 },
+            "the reference expired measured from the first sample"
+        );
+    }
+
+    /// The clock-offset step is a step *beyond* the adaptive threshold. Exactly at it,
+    /// the spec still calls the sample jitter, so the window is kept.
+    #[test]
+    fn a_step_exactly_at_the_threshold_is_still_jitter() {
+        let mut e = est();
+        e.observe(1000, 1000, 0); // d = 0
+        e.observe(1010, 1090, 0); // d = -80: exactly the threshold
+        assert_eq!(
+            e.sample_count(),
+            2,
+            "a step at the boundary cleared the window"
+        );
     }
 
     /// Monotonic time is a precondition; if it is violated the window must not

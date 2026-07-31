@@ -94,6 +94,12 @@ pub struct JitterBuffer {
     /// Hard latency bound: on resync, retain at most this many packets.
     retain_cap_packets: usize,
     pub late_discards: u64,
+    /// Timeline breaks caused by a *proven* new generation — a pkt_id reset with
+    /// transport evidence behind it. A subset of `resync_events`, which also counts
+    /// gap-driven breaks and the safety valve. The pipeline watches this one to know
+    /// when the sender's clock offset may have changed, because that is the only
+    /// event justifying a reset of the depth statistic.
+    pub generation_resets: u64,
     pub duplicate_discards: u64,
     pub conceal_events: u64,
     pub outage_events: u64,
@@ -138,6 +144,7 @@ impl JitterBuffer {
             reorder_window,
             retain_cap_packets,
             late_discards: 0,
+            generation_resets: 0,
             duplicate_discards: 0,
             conceal_events: 0,
             outage_events: 0,
@@ -170,7 +177,13 @@ impl JitterBuffer {
 
     /// Accepts an arrival.
     pub fn insert(&mut self, pkt_id: i32, payload: Bytes, now_ms: u64) {
-        self.last_arrival_ms = now_ms;
+        // `last_arrival_ms` is deliberately *not* set here: it drives the outage
+        // timer, and an arrival that is refused has not restarted the stream. Set
+        // here, a restarted stream whose every packet is being refused kept its own
+        // timer perpetually fresh, so the outage that would have rescued it never
+        // fired and the buffer emitted silence until the new ids caught up with the
+        // old ones — hours at 100 pps, and up to 248 days from the top of the id
+        // space. It is set at each acceptance point instead.
 
         // Anchor relative to whatever reference we have: the release position if
         // anchored, else the newest stored packet, else this packet itself.
@@ -191,7 +204,15 @@ impl JitterBuffer {
             }
             self.store.insert(seq, (pkt_id, payload));
             self.seq_hint = self.seq_hint.max(seq + 1);
-            self.on_accepted();
+            // Keep the store's span inside the horizons it accepts within on this
+            // path too. `newest()` advances with every forward arrival, so a rolling
+            // reference bounds each *step* but not the total: a sparse stream walked
+            // the span across the whole id space, after which one wire id maps to two
+            // sequences and is stored twice. Trimming the oldest is the same
+            // deliberate discard the safety valve makes, and is counted the same way.
+            self.trim_span_below(seq);
+            self.on_accepted(true);
+            self.last_arrival_ms = now_ms;
             return;
         }
 
@@ -214,7 +235,7 @@ impl JitterBuffer {
         // Cannot fire: the sequence space starts at 1 << 32, and the store's span is
         // capped below. A restart is nevertheless the right answer if it ever does.
         let Some(seq) = ref_seq.checked_sub(behind) else {
-            self.resync_to(pkt_id, payload);
+            self.resync_to(pkt_id, payload, now_ms);
             return;
         };
 
@@ -222,7 +243,7 @@ impl JitterBuffer {
             // Evidence outranks the floor: the floor describes slots of the stream
             // that just ended, and this packet belongs to the next one.
             self.generation_may_reset = false;
-            self.resync_to(pkt_id, payload);
+            self.resync_to(pkt_id, payload, now_ms);
             return;
         }
 
@@ -252,7 +273,8 @@ impl JitterBuffer {
         // unbounded span lets one wire id map to two sequences once it exceeds the id
         // modulus, which repeated downward re-anchoring in Priming can reach: each
         // step moves the reference down by a reorder window, and 32,768 of them cover
-        // 2^31.
+        // 2^31. Downward there is nothing to trim to make room, so this one is
+        // refused rather than accommodated.
         if let Some((newest_seq, _)) = self.newest() {
             if newest_seq.saturating_sub(seq)
                 > (self.accept_ahead_packets + self.reorder_window) as u64
@@ -262,7 +284,8 @@ impl JitterBuffer {
             }
         }
         self.store.insert(seq, (pkt_id, payload));
-        self.on_accepted();
+        self.on_accepted(false);
+        self.last_arrival_ms = now_ms;
     }
 
     /// The source connection was re-established.
@@ -274,13 +297,36 @@ impl JitterBuffer {
         self.generation_may_reset = true;
     }
 
-    /// Bookkeeping common to every accepted arrival.
-    fn on_accepted(&mut self) {
-        // A reconnect explains at most the arrivals up to the point the stream
-        // resumes. Once one is accepted normally — which after an ordinary
-        // reconnect it is, because the sender's ids carry on — a later backward
-        // jump is no longer explained by it.
-        self.generation_may_reset = false;
+    /// Discards from the oldest until the store spans no more than the horizons it
+    /// accepts within, given a newly placed `seq` at the top of the span.
+    fn trim_span_below(&mut self, seq: u64) {
+        let span_cap = (self.accept_ahead_packets + self.reorder_window) as u64;
+        let mut dropped = false;
+        while let Some((oldest_seq, _)) = self.oldest() {
+            if seq.saturating_sub(oldest_seq) <= span_cap {
+                break;
+            }
+            self.store.remove(&oldest_seq);
+            self.abandon_upto(oldest_seq + 1);
+            dropped = true;
+        }
+        if dropped {
+            self.resync_events += 1;
+        }
+    }
+
+    /// Bookkeeping common to every accepted arrival. `forward` distinguishes one that
+    /// continues the stream from a straggler placed behind the reference.
+    fn on_accepted(&mut self, forward: bool) {
+        // A reconnect explains the arrivals up to the point the stream resumes, and
+        // only a *forward* arrival is the stream resuming: after an ordinary
+        // reconnect the sender's ids carry on, so the evidence has done its job. A
+        // straggler accepted behind the anchor is leftover from the generation that
+        // just ended and must not consume it — doing so left the restarted stream
+        // with no evidence and every one of its packets refused as late.
+        if forward {
+            self.generation_may_reset = false;
+        }
         // The *first arrival* ends an outage, per the state machine — any arrival,
         // not only one ahead of the reference. Gating this on the ahead branch left
         // a genuine recovery packet accepted but stranded in Outage, with the
@@ -309,7 +355,7 @@ impl JitterBuffer {
     /// symmetry with the genuine discard sites would drop them. The gap is what
     /// keeps those stragglers from landing in the old generation's abandoned slots,
     /// where the floor would refuse them.
-    fn resync_to(&mut self, pkt_id: i32, payload: Bytes) {
+    fn resync_to(&mut self, pkt_id: i32, payload: Bytes, now_ms: u64) {
         self.store.clear();
         self.seq_hint += self.reorder_window as u64 + 1;
         let seq = self.seq_hint;
@@ -318,6 +364,8 @@ impl JitterBuffer {
         self.next = Some((seq, pkt_id));
         self.state = State::Priming;
         self.resync_events += 1;
+        self.generation_resets += 1;
+        self.last_arrival_ms = now_ms;
     }
 
     /// Raises the floor below which no arrival may be accepted.
@@ -758,6 +806,77 @@ mod tests {
         assert_eq!(j.release(1010), Released::Real(pkt(9)));
     }
 
+    /// The evidence has to outlive a straggler from the generation that just ended.
+    /// Clearing it on *any* accepted arrival left the restarted stream unexplained,
+    /// and then — because a refused arrival also refreshed the outage timer — every
+    /// one of its packets was rejected while its own traffic kept the backstop from
+    /// ever firing. The buffer emitted silence until the new ids caught up with the
+    /// old: hours at 100 pps, and up to 248 days from the top of the id space.
+    #[test]
+    fn reconnect_evidence_outlives_a_straggler_from_the_old_generation() {
+        let mut j = jb();
+        j.insert(999_999, pkt(1), 1000);
+        assert_eq!(j.release(1010), Released::Real(pkt(1)));
+        j.release(1300); // -> Outage
+        j.insert(1_000_002, pkt(2), 2000); // the old generation resumes -> Priming
+
+        j.on_source_reconnect();
+        j.insert(1_000_001, pkt(3), 2001); // a straggler, still the old generation
+        assert_eq!(j.late_discards, 0);
+
+        // The restarted stream begins at 0, and must be recognised at once.
+        j.insert(0, pkt(9), 2010);
+        assert_eq!(j.generation_resets, 1, "the evidence was consumed early");
+        assert_eq!(j.late_discards, 0, "the restarted stream was refused");
+        assert_eq!(j.release_with_target(2020, 1), Released::Real(pkt(9)));
+    }
+
+    /// And refused arrivals must not hold the outage timer open, or the backstop that
+    /// bounds a missed reconnect never fires.
+    #[test]
+    fn refused_arrivals_do_not_hold_the_outage_timer_open() {
+        let mut j = jb();
+        j.insert(999_999, pkt(1), 1000);
+        assert_eq!(j.release(1010), Released::Real(pkt(1)));
+        j.release(1300); // -> Outage
+        j.insert(1_000_002, pkt(2), 2000); // -> Priming, one packet, target 4
+
+        // A restarted stream with no reconnect reported: every packet is refused,
+        // one every 10 ms, for well over the threshold.
+        for k in 0..100i32 {
+            j.insert(k, pkt(9), 2010 + k as u64 * 10);
+        }
+        assert_eq!(j.late_discards, 100, "the restarted stream was not refused");
+        assert_eq!(
+            j.release_with_target(2300, 4),
+            Released::Silence,
+            "still priming, as expected"
+        );
+        assert_eq!(
+            j.state(),
+            State::Outage,
+            "refused traffic kept the outage timer fresh"
+        );
+    }
+
+    /// The span cap has to hold on the forward path too. `newest()` advances with
+    /// every arrival, so a rolling reference bounds each step but not the total: a
+    /// sparse stream walked the span across the whole id space, after which one wire
+    /// id maps to two sequences and is stored twice.
+    #[test]
+    fn a_sparse_forward_stream_does_not_walk_the_store_span() {
+        let mut j = JitterBuffer::new(200, 8, 32, 16, 1024); // span cap 32 + 16
+        for k in 0..20i32 {
+            j.insert(k * 32, pkt(1), 1000 + k as u64); // each a full horizon ahead
+        }
+        assert!(
+            j.buffered() <= 3,
+            "store spans the whole stream: {} packets",
+            j.buffered()
+        );
+        assert!(j.resync_events > 0, "the span trim was not counted");
+    }
+
     /// Without that evidence a backward jump is a replay, not a restart: a TCP
     /// connection cannot deliver one, so a sender restart always brings a reconnect.
     /// The outage backstop is what keeps a missed reconnect from stalling forever.
@@ -900,20 +1019,18 @@ mod tests {
             j.release(1000 + k as u64);
         }
 
-        // Two ids behind the anchor, not one: at a distance of exactly one the new
-        // generation's slot coincides with the old floor and is admitted by
-        // equality, which would leave the generation gap untested.
+        // A head several ids behind the first to arrive, not one or two: nearer than
+        // that, the new generation's slot coincides with the old floor and is admitted
+        // by equality however small the gap, which left the gap itself untested.
         j.on_source_reconnect();
-        j.insert(2, pkt(2), 1100); // restart; id 2 arrives first
+        j.insert(16, pkt(2), 1100); // restart; id 16 arrives first
         assert_eq!(j.resync_events, 1);
-        j.insert(1, pkt(3), 1101);
-        j.insert(0, pkt(4), 1102);
+        j.insert(8, pkt(3), 1101); // eight behind it, inside the reorder window
         assert_eq!(j.late_discards, 0, "the new generation's head was dropped");
-        assert_eq!(j.next_id(), Some(0), "the anchor did not grow downward");
-        assert_eq!(j.release_with_target(1110, 3), Released::Real(pkt(4)));
-        assert_eq!(j.release_with_target(1120, 3), Released::Real(pkt(3)));
-        assert_eq!(j.release_with_target(1130, 3), Released::Real(pkt(2)));
-        assert_eq!(j.conceal_events, 0);
+        assert_eq!(j.next_id(), Some(8), "the anchor did not grow downward");
+        assert_eq!(j.release_with_target(1110, 2), Released::Real(pkt(3)));
+        // 9..=15 never arrived, so they are concealed in place before id 16.
+        assert_eq!(j.release_with_target(1120, 2), Released::Repeat(pkt(3)));
     }
 
     /// A re-sent packet from the start of a cold-start burst is behind the newest

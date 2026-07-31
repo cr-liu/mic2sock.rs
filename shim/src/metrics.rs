@@ -171,18 +171,21 @@ mod tests {
                     .strip_prefix('"')
                     .and_then(|k| k.strip_suffix('"'))
                     .unwrap_or_else(|| panic!("unquoted key: {:?}", key));
-                // Strict enough to reject what a real parser rejects: an optional
-                // leading sign, at least one digit either side of at most one point.
-                // A "contains only digits, minus and dot" predicate accepted `0.`
-                // and `1.2.3`, which no JSON parser does.
+                // JSON's number grammar for the subset this serializer emits: an
+                // optional sign, an integer part with no leading zero, and an optional
+                // fraction of at least one digit. Looser predicates blessed malformed
+                // output — "digits, minus and dot" accepted `0.` and `1.2.3`, and
+                // "any run of digits" accepted `00`, which no parser takes.
                 let numeric = {
                     let body = value.strip_prefix('-').unwrap_or(value);
                     let mut parts = body.split('.');
                     let int = parts.next().unwrap_or("");
                     let frac = parts.next().unwrap_or("0");
+                    let no_leading_zero = int == "0" || !int.starts_with('0');
                     parts.next().is_none()
                         && !int.is_empty()
                         && !frac.is_empty()
+                        && no_leading_zero
                         && int.chars().all(|c| c.is_ascii_digit())
                         && frac.chars().all(|c| c.is_ascii_digit())
                 };
@@ -310,7 +313,32 @@ mod tests {
         m.max_depth_hit = 1;
         let line = m.to_json_line(12_345, 80, 1.0005);
         let fields = parse_flat_json(&line);
-        assert_eq!(fields.len(), 15, "field count changed: {}", line);
+        // The whole schema, in order: a consumer of this file parses by key, so a
+        // renamed or dropped one is a silent break. Asserting a handful of them left
+        // nine keys free to be renamed with every test still green.
+        let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "t_ms",
+                "arrivals",
+                "conceal_events",
+                "conceal_samples",
+                "outage_events",
+                "resync_events",
+                "late_discards",
+                "duplicate_discards",
+                "catchup_overflow",
+                "max_depth_hit",
+                "d_target_ms",
+                "step",
+                "p50_ms",
+                "p99_ms",
+                "p99_9_ms",
+            ],
+            "the JSONL schema changed: {}",
+            line
+        );
         for (key, want) in [
             ("t_ms", "12345"),
             ("arrivals", "1"),
