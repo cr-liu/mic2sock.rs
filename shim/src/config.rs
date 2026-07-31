@@ -477,6 +477,26 @@ source_port = 7998
         assert!(with("outage_threshold_ms = 5").is_err());
     }
 
+    /// The shipped example must be a config the shim will actually accept. It is the
+    /// first thing an operator copies, and `deny_unknown_fields` plus the pinned
+    /// geometry mean a stale example fails at *their* startup rather than in CI.
+    /// Compiled in, so it cannot drift from this crate.
+    #[test]
+    fn the_shipped_example_config_parses() {
+        let example = include_str!("../shim.toml.example");
+        let c = parse(example).expect("shim.toml.example must be valid");
+        assert_eq!(c.layout().packet_len(), 5452);
+        // And the values it documents are the ones the code defaults to, so the
+        // example never quietly disagrees with the built-in behaviour.
+        let defaults = parse(MINIMAL).unwrap();
+        assert_eq!(c.d_max_adaptive_ms, defaults.d_max_adaptive_ms);
+        assert_eq!(c.catchup_max_ms, defaults.catchup_max_ms);
+        assert_eq!(c.catchup_clamp, defaults.catchup_clamp);
+        assert_eq!(c.catchup_slew_per_sec, defaults.catchup_slew_per_sec);
+        assert_eq!(c.max_depth_ms, defaults.max_depth_ms);
+        assert_eq!(c.outage_threshold_ms, defaults.outage_threshold_ms);
+    }
+
     /// A misspelled key that is silently ignored leaves the operator believing
     /// the setting took effect -- the same confusion the fail-loud policy is for.
     #[test]
