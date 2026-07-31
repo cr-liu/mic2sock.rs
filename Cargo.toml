@@ -1,9 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["protocol", "clocksync", "mic2sock"]
+members = ["protocol", "clocksync", "shim", "mic2sock"]
 
 # mic2sock is excluded: it needs libjack, and jack-sys's build script panics on
 # any machine without jack.pc (including CI containers). So a bare `cargo build`
 # / `cargo test` covers only the pure-logic crates and silently does NOT build
 # the daemon. On the Pi: cargo build -p mic2sock --release
-default-members = ["protocol", "clocksync"]
+#
+# shim IS included: it has no libjack dependency and must build everywhere,
+# including the Windows box that runs it.
+default-members = ["protocol", "clocksync", "shim"]
