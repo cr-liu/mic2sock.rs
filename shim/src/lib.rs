@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod depth;
+pub mod jitter;
 pub mod metrics;
 
 pub use config::Config;

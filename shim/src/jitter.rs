@@ -1,0 +1,602 @@
+use bytes::Bytes;
+use std::collections::btree_map::Entry;
+use std::collections::BTreeMap;
+
+/// What the pipeline should emit next.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Released {
+    /// A real packet from the source.
+    Real(Bytes),
+    /// Concealment for a short gap: a repeat of the previous packet.
+    ///
+    /// Repeating rather than inserting silence keeps the inter-channel phase
+    /// relationships intact, so the downstream separator sees a frozen source
+    /// rather than "everything vanished at once".
+    Repeat(Bytes),
+    /// Silence, for an outage or while priming.
+    Silence,
+    /// Nothing may be emitted yet.
+    Nothing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    Normal,
+    /// No arrivals for longer than the threshold. Emits silence; the release
+    /// position is frozen.
+    Outage,
+    /// Re-anchored after an outage, accumulating depth before resuming.
+    Priming,
+}
+
+/// Size of the sender's id space. `mic2sock`'s `process_send_buf` walks
+/// `0, 1, ..., i32::MAX - 1` and then returns to 0, so `i32::MAX` itself never
+/// appears and the modulus is exactly that.
+const ID_MODULUS: i64 = i32::MAX as i64;
+
+/// How far forward from `from` to `to` in the sender's cyclic id space.
+///
+/// Exact modular arithmetic rather than stepping: this needs a genuine distance
+/// (a 40-packet burst would otherwise cost 40 steps), and being exact is what
+/// makes the `i32::MAX -> 0` discontinuity a non-event.
+fn forward_distance(from: i32, to: i32) -> u64 {
+    let d = (to as i64 - from as i64).rem_euclid(ID_MODULUS);
+    d as u64
+}
+
+/// Reorders, deduplicates, conceals gaps in place, and decides what to release.
+///
+/// Release timing is **not** driven by a timer — the caller asks for the next
+/// item only when the consumer's socket accepted a write, so the consumer's read
+/// rate paces the whole pipeline.
+pub struct JitterBuffer {
+    /// Keyed by a monotonic internal sequence number, deliberately **not** by
+    /// `pkt_id`: ordering by the wire id reports oldest and newest backwards for
+    /// a store straddling the `i32::MAX -> 0` wrap.
+    store: BTreeMap<u64, (i32, Bytes)>,
+    /// Sequence number of the next packet to release, and its wire id. `None`
+    /// until the first release, so an out-of-order opening pair can still be
+    /// reordered instead of having the first arrival fix the anchor.
+    next: Option<(u64, i32)>,
+    /// Monotonic counter for assigning sequence numbers.
+    seq_hint: u64,
+    state: State,
+    last_real: Option<Bytes>,
+    last_arrival_ms: u64,
+    outage_threshold_ms: u64,
+    /// Largest gap, in packets, still worth concealing at release time. Beyond
+    /// this the timeline is broken deliberately and counted.
+    max_conceal_packets: usize,
+    /// How far ahead of the release position an arriving packet may be and still
+    /// be buffered. Unrelated to `max_conceal_packets`: during a burst, packets
+    /// far ahead are exactly what should be kept.
+    accept_ahead_packets: usize,
+    reorder_window: usize,
+    /// Hard latency bound: on resync, retain at most this many packets.
+    retain_cap_packets: usize,
+    pub late_discards: u64,
+    pub duplicate_discards: u64,
+    pub conceal_events: u64,
+    pub outage_events: u64,
+    pub resync_events: u64,
+}
+
+impl JitterBuffer {
+    pub fn new(
+        outage_threshold_ms: u64,
+        max_conceal_packets: usize,
+        accept_ahead_packets: usize,
+        reorder_window: usize,
+        retain_cap_packets: usize,
+    ) -> Self {
+        assert!(retain_cap_packets > 0, "retain_cap_packets must be > 0");
+        JitterBuffer {
+            store: BTreeMap::new(),
+            next: None,
+            seq_hint: 1 << 32,
+            state: State::Normal,
+            last_real: None,
+            last_arrival_ms: 0,
+            outage_threshold_ms,
+            max_conceal_packets,
+            accept_ahead_packets,
+            reorder_window,
+            retain_cap_packets,
+            late_discards: 0,
+            duplicate_discards: 0,
+            conceal_events: 0,
+            outage_events: 0,
+            resync_events: 0,
+        }
+    }
+
+    pub fn state(&self) -> State {
+        self.state
+    }
+
+    /// Wire id of the next packet to release, if anchored.
+    pub fn next_id(&self) -> Option<i32> {
+        self.next.map(|(_, id)| id)
+    }
+
+    pub fn buffered(&self) -> usize {
+        self.store.len()
+    }
+
+    /// Sequence number and wire id of the oldest stored packet.
+    fn oldest(&self) -> Option<(u64, i32)> {
+        self.store.iter().next().map(|(&s, &(id, _))| (s, id))
+    }
+
+    /// Sequence number and wire id of the newest stored packet.
+    fn newest(&self) -> Option<(u64, i32)> {
+        self.store.iter().next_back().map(|(&s, &(id, _))| (s, id))
+    }
+
+    /// Accepts an arrival.
+    pub fn insert(&mut self, pkt_id: i32, payload: Bytes, now_ms: u64) {
+        self.last_arrival_ms = now_ms;
+
+        // Anchor relative to whatever reference we have: the release position if
+        // anchored, else the newest stored packet, else this packet itself.
+        // Newest rather than oldest, so that a long cold-start burst stays within
+        // `accept_ahead_packets` of its reference no matter how long it runs.
+        let reference = self
+            .next
+            .or_else(|| self.newest())
+            .unwrap_or((self.seq_hint, pkt_id));
+        let (ref_seq, ref_id) = reference;
+
+        let ahead = forward_distance(ref_id, pkt_id);
+        if ahead as usize <= self.accept_ahead_packets {
+            let seq = ref_seq + ahead;
+            if self.store.contains_key(&seq) {
+                self.duplicate_discards += 1;
+                return;
+            }
+            self.store.insert(seq, (pkt_id, payload));
+            self.seq_hint = self.seq_hint.max(seq + 1);
+            if self.state == State::Outage {
+                self.state = State::Priming;
+                self.resync_events += 1;
+            }
+            if self.state == State::Priming {
+                // The anchor must be re-evaluated as the burst lands: the spec's
+                // "newest arrived id" keeps moving, so a one-shot anchor taken on
+                // the first arrival would be computed from a single packet.
+                self.reanchor_for_priming();
+            }
+            return;
+        }
+
+        let behind = forward_distance(pkt_id, ref_id);
+        if behind as usize <= self.reorder_window {
+            if self.next.is_some() {
+                // Behind the release position: already emitted.
+                self.late_discards += 1;
+                return;
+            }
+            // Not anchored yet, so nothing has been released and this is not late
+            // -- just a straggler that arrived after a packet ahead of it. Place
+            // it below the reference; `seq_hint` starts at 1 << 32 precisely to
+            // leave room to go backwards.
+            match self.store.entry(ref_seq - behind) {
+                Entry::Vacant(slot) => {
+                    slot.insert((pkt_id, payload));
+                }
+                Entry::Occupied(_) => self.duplicate_discards += 1,
+            }
+            return;
+        }
+
+        // Neither plausibly ahead nor a recent straggler: a source restart.
+        self.store.clear();
+        self.seq_hint += 1;
+        let seq = self.seq_hint;
+        self.store.insert(seq, (pkt_id, payload));
+        self.seq_hint = seq + 1;
+        self.next = Some((seq, pkt_id));
+        self.state = State::Priming;
+        self.resync_events += 1;
+    }
+
+    /// Keeps at most `retain_cap_packets`, anchoring at the oldest retained.
+    ///
+    /// The lower bound is clamped to the oldest packet actually present, per
+    /// spec: without that clamp the anchor can land behind everything in the
+    /// store, after which every subsequent arrival looks implausible.
+    fn reanchor_for_priming(&mut self) {
+        while self.store.len() > self.retain_cap_packets {
+            let oldest_seq = *self.store.keys().next().expect("non-empty");
+            self.store.remove(&oldest_seq);
+        }
+        if let Some((seq, id)) = self.oldest() {
+            self.next = Some((seq, id));
+        }
+    }
+
+    /// Releases the next item, with no priming gate.
+    pub fn release(&mut self, now_ms: u64) -> Released {
+        self.release_with_target(now_ms, 0)
+    }
+
+    /// Releases the next item.
+    ///
+    /// `target_packets` gates the exit from `Priming`: real audio does not resume
+    /// until that much is buffered. Occupancy only grows by concealing (output
+    /// without consuming input), so a shallow buffer cannot deepen on its own
+    /// while input and output rates are equal.
+    pub fn release_with_target(&mut self, now_ms: u64, target_packets: usize) -> Released {
+        if self.state != State::Outage
+            && now_ms.saturating_sub(self.last_arrival_ms) >= self.outage_threshold_ms
+            && self.store.is_empty()
+            && self.next.is_some()
+        {
+            self.state = State::Outage;
+            self.outage_events += 1;
+        }
+
+        match self.state {
+            // The release position is deliberately not advanced here.
+            State::Outage => Released::Silence,
+            State::Priming => {
+                if self.store.len() >= target_packets {
+                    self.state = State::Normal;
+                    self.release_normal(now_ms)
+                } else {
+                    Released::Silence
+                }
+            }
+            State::Normal => self.release_normal(now_ms),
+        }
+    }
+
+    fn release_normal(&mut self, _now_ms: u64) -> Released {
+        // Anchor lazily, at the oldest stored packet, so an out-of-order opening
+        // pair is reordered rather than half discarded.
+        if self.next.is_none() {
+            match self.oldest() {
+                Some(pos) => self.next = Some(pos),
+                None => return Released::Nothing,
+            }
+        }
+        let (next_seq, _) = self.next.expect("anchored above");
+
+        if let Some((id, payload)) = self.store.remove(&next_seq) {
+            self.next = Some((next_seq + 1, wrapping_next_id(id)));
+            self.last_real = Some(payload.clone());
+            return Released::Real(payload);
+        }
+
+        let Some((oldest_seq, oldest_id)) = self.oldest() else {
+            return Released::Nothing;
+        };
+        let gap = oldest_seq - next_seq;
+
+        if gap as usize <= self.max_conceal_packets {
+            // Conceal exactly one packet, in place, and advance by one.
+            let (_, next_id) = self.next.expect("anchored");
+            self.next = Some((next_seq + 1, wrapping_next_id(next_id)));
+            self.conceal_events += 1;
+            return match &self.last_real {
+                Some(p) => Released::Repeat(p.clone()),
+                None => Released::Silence,
+            };
+        }
+
+        // Beyond the conceal horizon: break the timeline deliberately and count it.
+        self.resync_events += 1;
+        self.next = Some((oldest_seq, oldest_id));
+        self.release_normal(_now_ms)
+    }
+
+    /// Safety valve: discards oldest until at most `max_packets` remain. Returns
+    /// how many were discarded. Should never fire in normal operation.
+    ///
+    /// Re-anchors only when it actually dropped something. Re-anchoring
+    /// unconditionally would jump the release position over a gap that was still
+    /// awaiting in-place concealment, shifting the far-end AEC reference against
+    /// the mic channels by the width of that gap with nothing counted -- the very
+    /// failure this module exists to prevent.
+    pub fn enforce_max_depth(&mut self, max_packets: usize) -> usize {
+        let mut dropped = 0;
+        while self.store.len() > max_packets {
+            let oldest_seq = *self.store.keys().next().expect("non-empty");
+            self.store.remove(&oldest_seq);
+            dropped += 1;
+        }
+        if dropped > 0 {
+            if let Some(pos) = self.oldest() {
+                self.next = Some(pos);
+            }
+            // Discarding buffered audio breaks the timeline deliberately, so it
+            // is counted like any other resync rather than being silent.
+            self.resync_events += 1;
+        }
+        dropped
+    }
+}
+
+/// The sender's successor for a wire id: `i32::MAX` never appears, so `MAX - 1`
+/// is followed by `0`.
+fn wrapping_next_id(id: i32) -> i32 {
+    let n = id.wrapping_add(1);
+    if n == i32::MAX {
+        0
+    } else {
+        n
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pkt(n: u8) -> Bytes {
+        Bytes::from(vec![n; 4])
+    }
+
+    /// outage_threshold 200 ms, conceal up to 8 packets, accept up to 200 packets
+    /// ahead, reorder window 16, retain at most 12 packets on resync.
+    fn jb() -> JitterBuffer {
+        JitterBuffer::new(200, 8, 200, 16, 12)
+    }
+
+    #[test]
+    fn forward_distance_is_exact_across_the_wrap() {
+        assert_eq!(forward_distance(100, 100), 0);
+        assert_eq!(forward_distance(100, 103), 3);
+        // MAX-1 is the last id before 0, so 0 is one step further on.
+        assert_eq!(forward_distance(i32::MAX - 1, 0), 1);
+        assert_eq!(forward_distance(i32::MAX - 2, 1), 3);
+        // Going backwards wraps all the way round.
+        assert_eq!(forward_distance(0, i32::MAX - 1), (i32::MAX - 1) as u64);
+    }
+
+    #[test]
+    fn releases_in_order() {
+        let mut j = jb();
+        j.insert(100, pkt(1), 1000);
+        j.insert(101, pkt(2), 1010);
+        assert_eq!(j.release(1020), Released::Real(pkt(1)));
+        assert_eq!(j.release(1030), Released::Real(pkt(2)));
+        assert_eq!(j.release(1040), Released::Nothing);
+    }
+
+    /// The anchor is taken at the first *release*, not the first arrival, so an
+    /// out-of-order opening pair is still reordered rather than half discarded.
+    #[test]
+    fn out_of_order_arrival_is_reordered() {
+        let mut j = jb();
+        j.insert(101, pkt(2), 1000);
+        j.insert(100, pkt(1), 1005);
+        assert_eq!(j.late_discards, 0, "nothing should have been discarded yet");
+        assert_eq!(j.release(1010), Released::Real(pkt(1)));
+        assert_eq!(j.release(1020), Released::Real(pkt(2)));
+    }
+
+    #[test]
+    fn duplicate_is_discarded() {
+        let mut j = jb();
+        j.insert(100, pkt(1), 1000);
+        j.insert(100, pkt(9), 1001);
+        assert_eq!(j.duplicate_discards, 1);
+        assert_eq!(j.release(1010), Released::Real(pkt(1)));
+    }
+
+    #[test]
+    fn a_packet_already_released_is_discarded_as_late() {
+        let mut j = jb();
+        j.insert(100, pkt(1), 1000);
+        j.release(1010);
+        j.insert(100, pkt(1), 1020);
+        assert_eq!(j.late_discards, 1);
+    }
+
+    /// The core rule: a gap is concealed **in place**, before the packet that
+    /// follows it. Concealing late would shift the far-end reference channel
+    /// against the mic channels, which at 16 kHz is 160 samples -- far outside an
+    /// AEC filter's converged region.
+    #[test]
+    fn a_gap_is_concealed_in_place_before_the_next_packet() {
+        let mut j = jb();
+        j.insert(100, pkt(1), 1000);
+        j.insert(102, pkt(3), 1010); // 101 is missing
+        assert_eq!(j.release(1020), Released::Real(pkt(1)));
+        assert_eq!(
+            j.release(1030),
+            Released::Repeat(pkt(1)),
+            "gap not concealed in place"
+        );
+        assert_eq!(j.release(1040), Released::Real(pkt(3)));
+        assert_eq!(j.conceal_events, 1);
+    }
+
+    #[test]
+    fn concealment_repeats_the_previous_packet_not_silence() {
+        let mut j = jb();
+        j.insert(100, pkt(7), 1000);
+        j.insert(102, pkt(9), 1010);
+        j.release(1020);
+        assert_eq!(j.release(1030), Released::Repeat(pkt(7)));
+    }
+
+    #[test]
+    fn no_arrivals_for_the_threshold_enters_outage_and_emits_silence() {
+        let mut j = jb();
+        j.insert(100, pkt(1), 1000);
+        assert_eq!(j.release(1010), Released::Real(pkt(1)));
+        assert_eq!(j.release(1210), Released::Silence);
+        assert_eq!(j.state(), State::Outage);
+        assert_eq!(j.outage_events, 1);
+    }
+
+    /// The release position must be frozen during an outage. If concealment
+    /// advanced it, a one-second outage would advance it by 100 packets and the
+    /// resync anchor would have to move *backwards*, which is self-contradictory.
+    #[test]
+    fn the_release_position_is_frozen_during_an_outage() {
+        let mut j = jb();
+        j.insert(100, pkt(1), 1000);
+        j.release(1010);
+        let frozen = j.next_id();
+        for t in 0..20 {
+            j.release(1210 + t * 10);
+        }
+        assert_eq!(j.next_id(), frozen, "the release position advanced");
+    }
+
+    /// After an outage, retain at most `retain_cap_packets`, discarding older
+    /// data. This is the hard latency bound: however long the outage was and
+    /// however much arrived at once, the buffer never resumes deeper than the cap.
+    ///
+    /// The cap is a **count of packets**, so 12 means 12 retained ids.
+    #[test]
+    fn resync_retains_exactly_the_cap_and_discards_older() {
+        let mut j = jb();
+        j.insert(100, pkt(1), 1000);
+        j.release(1010);
+        j.release(1300); // -> Outage
+
+        // 40 packets arrive at once; the cap is 12.
+        for k in 0..40i32 {
+            j.insert(200 + k, pkt(2), 2000);
+        }
+        assert_eq!(
+            j.buffered(),
+            12,
+            "retained {} packets, cap is 12",
+            j.buffered()
+        );
+        // Newest is 239, so the 12 retained are 228..=239 and the release
+        // position is the oldest of those.
+        assert_eq!(j.next_id(), Some(228));
+        assert_eq!(j.state(), State::Priming);
+    }
+
+    /// The opposite case: too little data arrives to reach the target depth. The
+    /// buffer must keep emitting silence and let arrivals accumulate, because
+    /// occupancy only grows by concealing -- it cannot "catch up on its own" when
+    /// input and output rates are equal.
+    ///
+    /// This also pins the spec's lower clamp: with only one packet present, the
+    /// anchor must clamp to that packet rather than land 12 behind it.
+    #[test]
+    fn priming_holds_silence_until_the_target_depth_is_reached() {
+        let mut j = jb();
+        j.insert(100, pkt(1), 1000);
+        j.release(1010);
+        j.release(1300); // -> Outage
+
+        j.insert(200, pkt(2), 2000); // one packet only
+        assert_eq!(j.state(), State::Priming);
+        assert_eq!(
+            j.next_id(),
+            Some(200),
+            "anchor was not clamped to the oldest"
+        );
+        assert_eq!(j.release_with_target(2010, 4), Released::Silence);
+        for k in 1..4i32 {
+            j.insert(200 + k, pkt(2), 2000 + k as u64);
+        }
+        assert_eq!(j.release_with_target(2100, 4), Released::Real(pkt(2)));
+        assert_eq!(j.state(), State::Normal);
+    }
+
+    /// A gap larger than is worth concealing breaks the timeline deliberately; it
+    /// must be counted rather than silently papered over.
+    #[test]
+    fn a_gap_beyond_max_conceal_resyncs_and_is_counted() {
+        let mut j = jb();
+        j.insert(100, pkt(1), 1000);
+        assert_eq!(j.release(1010), Released::Real(pkt(1)));
+        j.insert(150, pkt(2), 1020); // 49 packets missing, conceal cap is 8
+        assert_eq!(j.release(1030), Released::Real(pkt(2)));
+        assert_eq!(j.resync_events, 1);
+        assert_eq!(j.conceal_events, 0, "should not have tried to conceal");
+    }
+
+    /// The sender resets pkt_id to 0 at i32::MAX, so this must not look like a
+    /// source restart. Happens once every ~248 days at 100 pps.
+    #[test]
+    fn the_id_wrap_is_continuous() {
+        let mut j = jb();
+        j.insert(i32::MAX - 2, pkt(1), 1000);
+        assert_eq!(j.release(1010), Released::Real(pkt(1)));
+        j.insert(i32::MAX - 1, pkt(2), 1020);
+        assert_eq!(j.release(1030), Released::Real(pkt(2)));
+        j.insert(0, pkt(3), 1040);
+        assert_eq!(j.release(1050), Released::Real(pkt(3)), "wrap misread");
+        assert_eq!(j.resync_events, 0);
+        assert_eq!(j.conceal_events, 0);
+    }
+
+    /// A store holding ids on both sides of the wrap must still report its oldest
+    /// and newest correctly -- the defect that keying by `pkt_id` would reintroduce.
+    #[test]
+    fn a_burst_straddling_the_wrap_orders_correctly() {
+        let mut j = jb();
+        j.insert(i32::MAX - 2, pkt(1), 1000);
+        j.insert(i32::MAX - 1, pkt(2), 1001);
+        j.insert(0, pkt(3), 1002);
+        j.insert(1, pkt(4), 1003);
+        assert_eq!(j.buffered(), 4);
+        assert_eq!(j.release(1010), Released::Real(pkt(1)));
+        assert_eq!(j.release(1020), Released::Real(pkt(2)));
+        assert_eq!(j.release(1030), Released::Real(pkt(3)));
+        assert_eq!(j.release(1040), Released::Real(pkt(4)));
+        assert_eq!(j.conceal_events, 0);
+        assert_eq!(j.resync_events, 0);
+    }
+
+    #[test]
+    fn a_source_restart_resyncs() {
+        let mut j = jb();
+        for k in 0..20i32 {
+            j.insert(1000 + k, pkt(1), 1000 + k as u64);
+            j.release(1000 + k as u64);
+        }
+        j.insert(0, pkt(2), 1100); // pkt_id went back to 0
+        assert_eq!(j.resync_events, 1);
+        assert_eq!(j.release(1110), Released::Real(pkt(2)));
+    }
+
+    /// The safety valve. If the consumer stops reading, discard oldest rather
+    /// than grow without bound. Reachable only because `accept_ahead_packets` is
+    /// independent of the conceal horizon.
+    #[test]
+    fn exceeding_the_max_depth_discards_oldest() {
+        let mut j = jb();
+        for k in 0..100i32 {
+            j.insert(100 + k, pkt(1), 1000);
+        }
+        assert_eq!(
+            j.buffered(),
+            100,
+            "accept horizon too small to fill the store"
+        );
+        let dropped = j.enforce_max_depth(20);
+        assert_eq!(dropped, 80);
+        assert_eq!(j.buffered(), 20);
+    }
+
+    /// The safety valve must not re-anchor when it dropped nothing. Jumping the
+    /// release position over a gap still awaiting concealment would shift the
+    /// far-end AEC reference against the mic channels with nothing counted.
+    #[test]
+    fn max_depth_does_not_skip_a_pending_gap_when_it_drops_nothing() {
+        let mut j = jb();
+        j.insert(100, pkt(1), 1000);
+        j.insert(105, pkt(6), 1001); // 101..104 missing
+        assert_eq!(j.release(1010), Released::Real(pkt(1)));
+
+        assert_eq!(
+            j.enforce_max_depth(100),
+            0,
+            "nothing should have been dropped"
+        );
+        // The gap must still be concealed in place rather than skipped.
+        assert_eq!(j.release(1020), Released::Repeat(pkt(1)));
+        assert_eq!(j.conceal_events, 1);
+    }
+}
