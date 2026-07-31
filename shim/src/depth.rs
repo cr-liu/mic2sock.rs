@@ -112,7 +112,8 @@ impl DepthEstimator {
             }
         }
 
-        let above = (d - self.reference(d, now_ms)).max(0) as u64;
+        let d_ref = self.reference(d, now_ms);
+        let above = (d - d_ref).max(0) as u64;
 
         if above > self.d_max_adaptive_ms {
             // An outage. Deliberately NOT recorded: no buffer can cover it, and
@@ -122,7 +123,26 @@ impl DepthEstimator {
             };
         }
 
+        // A sample far *below* the reference is not jitter — nothing arrives half a
+        // second early. It is a step change in the clock offset, after which the
+        // samples taken on the old offset are no longer comparable: keeping them
+        // reports the step itself as the spread and pins the target at the cap for a
+        // minute. Retiring them is also what stops a re-baselined outage run from
+        // contaminating the window once delays return to normal.
+        if d < d_ref - self.d_max_adaptive_ms as i64 {
+            self.samples.clear();
+        }
+
         self.samples.push_back((now_ms, d));
+        // The accepted sample may itself be the new minimum, and the reference has
+        // to include it: classifying against a pre-insertion minimum left the
+        // durable value one sample stale, so a late packet arriving after the window
+        // had emptied was measured against too high a reference and filed as jitter.
+        // This is also the only place the expiry clock is wound, so that an outage
+        // run cannot extend the reference's life by finding old samples still in the
+        // window.
+        self.ref_ms = Some(self.ref_ms.map_or(d, |r| r.min(d)));
+        self.ref_updated_ms = now_ms;
         self.recompute(now_ms);
         Arrival::Jitter {
             above_min_ms: above,
@@ -151,7 +171,6 @@ impl DepthEstimator {
     fn reference(&mut self, d: i64, now_ms: u64) -> i64 {
         if let Some(min) = self.samples.iter().map(|&(_, d)| d).min() {
             self.ref_ms = Some(min);
-            self.ref_updated_ms = now_ms;
             return min;
         }
         match self.ref_ms {
@@ -162,6 +181,18 @@ impl DepthEstimator {
                 d
             }
         }
+    }
+
+    /// The source connection was re-established.
+    ///
+    /// A sender restart brings a new clock offset, and the old statistic describes
+    /// the old one. Expiry alone would get there eventually, but only after minutes
+    /// of classifying every arrival as an outage; a reconnect is direct evidence, so
+    /// it re-baselines immediately. It stays a backstop for the offset changes that
+    /// arrive without one — NTP stepping the sender's clock mid-stream.
+    pub fn on_source_reconnect(&mut self) {
+        self.samples.clear();
+        self.ref_ms = None;
     }
 
     /// Having to synthesize audio is direct evidence the buffer was too shallow.
@@ -384,6 +415,90 @@ mod tests {
         );
         assert_eq!(e.sample_count(), 1, "the stale sample was kept");
         assert_eq!(e.target_ms(), 20, "drift alone deepened the buffer");
+    }
+
+    /// The reference has to include the sample just accepted. Classifying against
+    /// the pre-insertion minimum left it one sample stale, so a packet arriving late
+    /// after the window emptied was measured against too high a value: with samples
+    /// at 20 then 0, a 90 ms delay measured 70 and was filed as jitter.
+    #[test]
+    fn a_new_minimum_becomes_the_reference_immediately() {
+        let mut e = est();
+        e.observe(1000, 980, 0); // d = 20
+        e.observe(1010, 1010, 0); // d = 0, the new minimum
+        assert_eq!(e.target_ms(), 40);
+
+        let t = WINDOW_MS + 1011;
+        assert_eq!(
+            e.observe(t, t - 90, 0),
+            Arrival::Outage { above_min_ms: 90 },
+            "measured against a reference one sample stale"
+        );
+        e.observe(t + 10, t + 10, 0);
+        assert!(e.target_ms() <= 40, "target rose to {}", e.target_ms());
+    }
+
+    /// Nothing arrives half a second early, so a step *down* is a change of clock
+    /// offset and not jitter. Keeping the samples taken on the old offset reported
+    /// the step itself as the spread and pinned the target at the cap for a minute.
+    #[test]
+    fn a_downward_offset_step_does_not_manufacture_jitter() {
+        let mut e = est();
+        e.observe(1000, 1000, 0); // d = 0
+        assert_eq!(e.target_ms(), 20);
+
+        // The sender restarts with its clock 500 ms further ahead: d steps to -500.
+        assert_eq!(
+            e.observe(1010, 1510, 0),
+            Arrival::Jitter { above_min_ms: 0 }
+        );
+        assert_eq!(e.sample_count(), 1, "the old offset's samples were kept");
+        assert_eq!(
+            e.target_ms(),
+            20,
+            "an offset step was read as 500 ms of jitter"
+        );
+    }
+
+    /// The expiry clock must run from the last accepted sample. Winding it whenever
+    /// a call merely found old samples still inside the window let an outage run
+    /// extend the reference's life by a further window.
+    #[test]
+    fn an_outage_does_not_extend_the_references_life() {
+        let mut e = est();
+        e.observe(0, 0, 0);
+        // An outage at the inclusive edge of the window: the sample is still there,
+        // but this call must not count as fresh evidence.
+        assert!(matches!(
+            e.observe(WINDOW_MS, WINDOW_MS - 500, 0),
+            Arrival::Outage { .. }
+        ));
+        assert_eq!(
+            e.observe(REF_EXPIRY_MS + 1, REF_EXPIRY_MS + 1 - 500, 0),
+            Arrival::Jitter { above_min_ms: 0 },
+            "the reference outlived REF_EXPIRY_MS measured from its last sample"
+        );
+    }
+
+    /// A reconnect is direct evidence of a possible new clock offset, so it
+    /// re-baselines at once instead of waiting out the expiry while calling every
+    /// arrival an outage.
+    #[test]
+    fn a_reconnect_re_baselines_the_reference() {
+        let mut e = est();
+        e.observe(1000, 1000, 0);
+        assert!(matches!(
+            e.observe(1010, 510, 0),
+            Arrival::Outage { above_min_ms: 500 }
+        ));
+
+        e.on_source_reconnect();
+        assert_eq!(
+            e.observe(1020, 520, 0),
+            Arrival::Jitter { above_min_ms: 0 },
+            "a reconnect did not re-baseline"
+        );
+        assert_eq!(e.target_ms(), 20);
     }
 
     /// Monotonic time is a precondition; if it is violated the window must not

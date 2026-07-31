@@ -171,10 +171,21 @@ mod tests {
                     .strip_prefix('"')
                     .and_then(|k| k.strip_suffix('"'))
                     .unwrap_or_else(|| panic!("unquoted key: {:?}", key));
-                let numeric = !value.is_empty()
-                    && value
-                        .chars()
-                        .all(|c| c.is_ascii_digit() || c == '-' || c == '.');
+                // Strict enough to reject what a real parser rejects: an optional
+                // leading sign, at least one digit either side of at most one point.
+                // A "contains only digits, minus and dot" predicate accepted `0.`
+                // and `1.2.3`, which no JSON parser does.
+                let numeric = {
+                    let body = value.strip_prefix('-').unwrap_or(value);
+                    let mut parts = body.split('.');
+                    let int = parts.next().unwrap_or("");
+                    let frac = parts.next().unwrap_or("0");
+                    parts.next().is_none()
+                        && !int.is_empty()
+                        && !frac.is_empty()
+                        && int.chars().all(|c| c.is_ascii_digit())
+                        && frac.chars().all(|c| c.is_ascii_digit())
+                };
                 assert!(
                     value == "null" || numeric,
                     "not a JSON number or null: {:?}",
