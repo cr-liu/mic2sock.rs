@@ -251,14 +251,22 @@ impl JitterBuffer {
 
     /// A source restart: neither plausibly ahead nor a recent straggler. Break the
     /// timeline deliberately, count it, and prime again.
+    ///
+    /// The new generation starts a reorder window clear of everything the old one
+    /// used, and the floor is deliberately **not** raised to the new anchor. The
+    /// arriving packet is the anchor but has not been released, so the ids just
+    /// behind it are stragglers of the new generation that still belong to the
+    /// timeline — the same argument as priming, and abandoning that slot for
+    /// symmetry with the genuine discard sites would drop them. The gap is what
+    /// keeps those stragglers from landing in the old generation's abandoned slots,
+    /// where the floor would refuse them.
     fn resync_to(&mut self, pkt_id: i32, payload: Bytes) {
         self.store.clear();
-        self.seq_hint += 1;
+        self.seq_hint += self.reorder_window as u64 + 1;
         let seq = self.seq_hint;
         self.store.insert(seq, (pkt_id, payload));
         self.seq_hint = seq + 1;
         self.next = Some((seq, pkt_id));
-        self.abandon_upto(seq);
         self.state = State::Priming;
         self.resync_events += 1;
     }
@@ -723,6 +731,34 @@ mod tests {
         assert_eq!(j.buffered(), 1, "the old generation was kept");
         assert_eq!(j.release(1010), Released::Real(pkt(9)));
         assert_eq!(j.conceal_events, 0, "concealed across two generations");
+    }
+
+    /// The restart anchor is the arriving packet, which has not been *released*, so
+    /// an id just behind it is a straggler of the new generation and still belongs
+    /// to the timeline. Raising the floor to the resync anchor for symmetry with the
+    /// genuine discard sites dropped it, and without the generation gap it would
+    /// land in a slot the old generation had already abandoned.
+    #[test]
+    fn a_reordered_head_of_a_new_generation_survives_the_restart() {
+        let mut j = jb();
+        for k in 0..20i32 {
+            j.insert(5000 + k, pkt(1), 1000 + k as u64);
+            j.release(1000 + k as u64);
+        }
+
+        // Two ids behind the anchor, not one: at a distance of exactly one the new
+        // generation's slot coincides with the old floor and is admitted by
+        // equality, which would leave the generation gap untested.
+        j.insert(2, pkt(2), 1100); // restart; id 2 arrives first
+        assert_eq!(j.resync_events, 1);
+        j.insert(1, pkt(3), 1101);
+        j.insert(0, pkt(4), 1102);
+        assert_eq!(j.late_discards, 0, "the new generation's head was dropped");
+        assert_eq!(j.next_id(), Some(0), "the anchor did not grow downward");
+        assert_eq!(j.release_with_target(1110, 3), Released::Real(pkt(4)));
+        assert_eq!(j.release_with_target(1120, 3), Released::Real(pkt(3)));
+        assert_eq!(j.release_with_target(1130, 3), Released::Real(pkt(2)));
+        assert_eq!(j.conceal_events, 0);
     }
 
     /// A re-sent packet from the start of a cold-start burst is behind the newest
