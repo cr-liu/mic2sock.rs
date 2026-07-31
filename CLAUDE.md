@@ -39,21 +39,29 @@ without `jack.pc`. So a bare `cargo build` / `cargo test` touches only the pure-
 and **silently does not build the daemon**. Building or running it requires an explicit
 `-p mic2sock`.
 
-`mic2sock/Cargo.toml` declares `rust-version = "1.63"`. That is load-bearing, not decorative:
-it is what makes cargo emit a **v3** `Cargo.lock` instead of v4, and lockfile v4 cannot be parsed
-by the cargo shipped in Debian bookworm (1.63) — without it, `cargo build -p mic2sock` fails on
-the Pi before compiling anything. Note the declaration is not self-enforcing: a routine
-`cargo update` can raise a dependency's own MSRV past 1.63 without any warning.
+`mic2sock/Cargo.toml` declares `rust-version = "1.65"`. That is load-bearing, not decorative:
+it is what makes cargo emit a **v3** `Cargo.lock` instead of v4, and a v4 lockfile cannot be
+parsed by the cargo the Pi runs — without it, `cargo build -p mic2sock` fails there before
+compiling anything. Debian bookworm ships rustc 1.63 with cargo 1.65, and 1.65 still rejects v4.
+
+1.65 is also the real floor: `protocol/src/gap.rs` uses let-else (stabilized 1.65) and the locked
+`winnow 0.4.5` declares 1.64, so anything lower is a false claim rather than a conservative one.
+The declaration is not self-enforcing either — a routine `cargo update` can raise a dependency's
+own MSRV past it with no warning. There is no MSRV check in CI.
 
 Run from a directory containing `config.toml` — the path is relative to the CWD, so
 `cargo run -p mic2sock` from the repo root works. If `config.toml` is missing or fails to parse, the program does **not** fail: it
 writes defaults to `conf.toml`, prints "please rename it to config.toml", and keeps running on those
 defaults. A confusing config bug is usually this path being hit silently.
 
-There are no tests (`#[cfg(test)]` appears nowhere). Verification is empirical: run the daemon and
-attach a client. `asio_client.cpp` is a standalone reference consumer that prints packet headers; it
-is in no build system — compile it by hand against standalone Asio, and note its `pkt_len = 5452` is
-hardcoded for 16 mic + 1 resend channel at 160 samples/packet.
+`protocol` and `clocksync` are unit tested (`cargo test`, 72 tests, no hardware needed).
+**`mic2sock` itself has no tests** — verification there is empirical: run the daemon and attach a
+client. That asymmetry is deliberate: policy logic lives in the two pure crates precisely so it can
+be tested without libjack, leaving `mic2sock` as thin wiring.
+
+`asio_client.cpp` is a standalone reference consumer that prints packet headers; it is in no build
+system — compile it by hand against standalone Asio, and note its `pkt_len = 5452` is hardcoded for
+16 mic + 1 resend channel at 160 samples/packet, so changing `sample_per_packet` breaks it.
 
 ## Wire format
 

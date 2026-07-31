@@ -2,11 +2,20 @@
 name = "mic2sock"
 version = "0.1.0"
 edition = "2021"
-# Load-bearing: a low rust-version is what makes cargo emit a v3 Cargo.lock.
-# Lockfile v4 needs cargo >=1.80 and Debian bookworm (the Pi) ships 1.63, where
-# a v4 lockfile fails to parse before anything is compiled. Not self-enforcing:
-# a routine `cargo update` can raise a dep's own MSRV past this without warning.
-rust-version = "1.63"
+# Load-bearing: a low rust-version is what makes cargo emit a v3 Cargo.lock
+# (verified on this toolchain: 1.65 -> v3, no rust-version -> v4). A v4 lockfile
+# cannot be parsed by the cargo the Pi runs, so it would break the build before
+# compiling anything. Debian bookworm ships rustc 1.63 with cargo 1.65, and 1.65
+# still rejects v4.
+#
+# 1.65 specifically, not lower: protocol/src/gap.rs uses let-else, stabilized in
+# 1.65, and the locked winnow 0.4.5 declares rust-version 1.64. An earlier 1.63
+# here was simply false -- cargo check would have failed on the Pi for both
+# reasons.
+#
+# Not self-enforcing: a routine `cargo update` can raise a dependency's own MSRV
+# past this with no warning.
+rust-version = "1.65"
 
 [dependencies]
 jack = { version = "0.11" }
