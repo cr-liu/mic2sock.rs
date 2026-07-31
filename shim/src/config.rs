@@ -235,11 +235,11 @@ impl Config {
             ));
         }
 
-        if !self.catchup_clamp.is_finite() || !(0.0..1.0).contains(&self.catchup_clamp) {
+        // Spelled out rather than using a range: `(0.0..1.0)` contains 0.0, so a
+        // range test needs a second, non-obvious check to exclude it.
+        if !self.catchup_clamp.is_finite() || self.catchup_clamp <= 0.0 || self.catchup_clamp >= 1.0
+        {
             return Err("catchup_clamp must be finite and in (0, 1)".into());
-        }
-        if self.catchup_clamp == 0.0 {
-            return Err("catchup_clamp must be in (0, 1)".into());
         }
         // `nan <= 0.0` is false, so without the finiteness test NaN passed here
         // and panicked later inside DepthController; infinity passed and removed
