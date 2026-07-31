@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 
 /// What the pipeline should emit next.
@@ -38,11 +37,16 @@ const ID_MODULUS: i64 = i32::MAX as i64;
 ///
 /// Direction in a cyclic id space is only unambiguous while the horizons stay
 /// far below half the modulus: with `accept_ahead_packets = i32::MAX` a mere
-/// duplicate reads as nearly a whole modulus *ahead* and is stored a second
-/// time. `1 << 20` packets is about three hours at 100 pps — beyond any useful
-/// buffer, and still a thousandfold below `ID_MODULUS / 2`. It is also what
-/// bounds how far the cold-start store may reach below `seq_hint`.
-pub const MAX_HORIZON_PACKETS: usize = 1 << 20;
+/// duplicate reads as nearly a whole modulus *ahead* and is stored a second time.
+/// 65,536 packets is eleven minutes at 100 pps — far beyond any useful buffer for
+/// a 3 s design, and small enough that the cold-start store's total downward
+/// reach (bounded by one reorder window below an unmoving newest) stays a factor
+/// of 32,000 short of the `1 << 32` headroom the sequence space starts with.
+///
+/// `1 << 20` was too generous to carry that second claim: 2,046 crafted arrivals,
+/// each stepping a full million below the last, walked the store's span to 2.1
+/// billion sequences and made direction ambiguous again.
+pub const MAX_HORIZON_PACKETS: usize = 65_536;
 
 /// How far forward from `from` to `to` in the sender's cyclic id space.
 ///
@@ -68,6 +72,9 @@ pub struct JitterBuffer {
     /// until the first release, so an out-of-order opening pair can still be
     /// reordered instead of having the first arrival fix the anchor.
     next: Option<(u64, i32)>,
+    /// Sequence below which nothing may be accepted, because the consumer either
+    /// already has that slot or will never get it. See `abandon_upto`.
+    floor_seq: Option<u64>,
     /// Monotonic counter for assigning sequence numbers.
     seq_hint: u64,
     state: State,
@@ -117,6 +124,7 @@ impl JitterBuffer {
         JitterBuffer {
             store: BTreeMap::new(),
             next: None,
+            floor_seq: None,
             seq_hint: 1 << 32,
             state: State::Normal,
             last_real: None,
@@ -180,76 +188,97 @@ impl JitterBuffer {
             }
             self.store.insert(seq, (pkt_id, payload));
             self.seq_hint = self.seq_hint.max(seq + 1);
-            if self.state == State::Outage {
-                self.state = State::Priming;
-                self.resync_events += 1;
-            }
-            if self.state == State::Priming {
-                // The anchor must be re-evaluated as the burst lands: the spec's
-                // "newest arrived id" keeps moving, so a one-shot anchor taken on
-                // the first arrival would be computed from a single packet.
-                self.reanchor_for_priming();
-            }
+            self.on_accepted();
             return;
         }
 
-        // Behind the reference. The reorder window measured from the reference is
-        // the wrong test for "did the source restart": a re-sent packet from the
-        // start of a cold-start burst is behind the *newest* by the whole length
-        // of the burst, which used to clear the entire store as if the sender had
-        // rebooted. What matters is whether the id maps into the span this buffer
-        // already covers, so the window is measured from the oldest sequence that
-        // still means anything, not from the reference.
+        // Behind the reference. Two separate questions, and the old code asked
+        // only one of them.
         let behind = forward_distance(pkt_id, ref_id);
-        let floor_seq = self
-            .next
-            .map(|(seq, _)| seq)
-            .or_else(|| self.oldest().map(|(seq, _)| seq))
-            .unwrap_or(ref_seq);
-        // Also bounded by `ref_seq` itself, so the subtraction below cannot
-        // underflow; the sequence space starts at 1 << 32 to leave that headroom.
-        let reach = (ref_seq - floor_seq + self.reorder_window as u64).min(ref_seq);
-        if behind <= reach {
-            let seq = ref_seq - behind;
-            match self.store.entry(seq) {
-                Entry::Occupied(_) => {
-                    self.duplicate_discards += 1;
-                    return;
-                }
-                Entry::Vacant(slot) => {
-                    // Only *late* if the release position was earned by emitting
-                    // audio. While priming -- and before the first release -- it
-                    // was assigned rather than reached, so a packet behind it is a
-                    // straggler that still belongs to the timeline: nothing has
-                    // been emitted in its place, and discarding it loses that
-                    // audio for good.
-                    let emitted = match self.next {
-                        Some((next_seq, _)) => seq < next_seq && self.state != State::Priming,
-                        None => false,
-                    };
-                    if emitted {
-                        self.late_discards += 1;
-                        return;
-                    }
-                    slot.insert((pkt_id, payload));
-                }
-            }
-            if self.state == State::Priming {
-                // Grow downward: the anchor follows the oldest retained packet.
-                self.reanchor_for_priming();
-            }
+        // Cannot fire: the sequence space starts at 1 << 32 and the downward reach
+        // is one reorder window below a reference that does not move down. A
+        // restart is nevertheless the right answer if it ever does.
+        let Some(seq) = ref_seq.checked_sub(behind) else {
+            self.resync_to(pkt_id, payload);
+            return;
+        };
+
+        // First question: do we already hold this slot? A re-sent packet from the
+        // start of a cold-start burst is behind the *newest* by the whole length of
+        // the burst, far outside the reorder window, and reading that as a source
+        // restart cleared the entire store. The lookup is exact, so it may reach as
+        // far back as the store itself does.
+        if self.store.contains_key(&seq) {
+            self.duplicate_discards += 1;
             return;
         }
 
-        // Neither plausibly ahead nor a recent straggler: a source restart.
+        // Second question: straggler, or a new generation? A *vacant* slot that far
+        // back is genuinely ambiguous — id 0 arriving while we hold 5..=20 could be
+        // a late packet or a restarted sender — so the reorder window still decides
+        // that one, which is what it is for.
+        if behind as usize <= self.reorder_window {
+            if self.floor_seq.map_or(false, |floor| seq < floor) {
+                self.late_discards += 1;
+                return;
+            }
+            self.store.insert(seq, (pkt_id, payload));
+            self.on_accepted();
+            return;
+        }
+
+        self.resync_to(pkt_id, payload);
+    }
+
+    /// Bookkeeping common to every accepted arrival.
+    fn on_accepted(&mut self) {
+        // The *first arrival* ends an outage, per the state machine — any arrival,
+        // not only one ahead of the reference. Gating this on the ahead branch left
+        // a genuine recovery packet accepted but stranded in Outage, with the
+        // buffer holding it and no path back out.
+        if self.state == State::Outage {
+            self.state = State::Priming;
+            self.resync_events += 1;
+        }
+        if self.state == State::Priming {
+            // The anchor must be re-evaluated as the burst lands: the spec's
+            // "newest arrived id" keeps moving, so a one-shot anchor taken on the
+            // first arrival would be computed from a single packet. This is also
+            // what grows the anchor downward onto a straggler below it.
+            self.reanchor_for_priming();
+        }
+    }
+
+    /// A source restart: neither plausibly ahead nor a recent straggler. Break the
+    /// timeline deliberately, count it, and prime again.
+    fn resync_to(&mut self, pkt_id: i32, payload: Bytes) {
         self.store.clear();
         self.seq_hint += 1;
         let seq = self.seq_hint;
         self.store.insert(seq, (pkt_id, payload));
         self.seq_hint = seq + 1;
         self.next = Some((seq, pkt_id));
+        self.abandon_upto(seq);
         self.state = State::Priming;
         self.resync_events += 1;
+    }
+
+    /// Raises the floor below which no arrival may be accepted.
+    ///
+    /// The floor is what answers "has the consumer had this slot?". `next` cannot:
+    /// re-anchoring reassigns it without anything being emitted. Using the *state*
+    /// as a proxy was wrong in both directions — it re-admitted audio that had
+    /// already been played (and played it twice), and it discarded audio that never
+    /// had been.
+    ///
+    /// It rises only where a slot is genuinely consumed or discarded, never where
+    /// the anchor is merely reassigned: priming deliberately moves the anchor down
+    /// onto a straggler, and that has to stay possible.
+    fn abandon_upto(&mut self, seq: u64) {
+        self.floor_seq = Some(match self.floor_seq {
+            Some(f) => f.max(seq),
+            None => seq,
+        });
     }
 
     /// Keeps at most `retain_cap_packets`, anchoring at the oldest retained.
@@ -261,6 +290,9 @@ impl JitterBuffer {
         while self.store.len() > self.retain_cap_packets {
             let oldest_seq = *self.store.keys().next().expect("non-empty");
             self.store.remove(&oldest_seq);
+            // Trimming to the cap discards audio, so those slots must not be
+            // reopened by a straggler that arrives for one of them later.
+            self.abandon_upto(oldest_seq + 1);
         }
         if let Some((seq, id)) = self.oldest() {
             self.next = Some((seq, id));
@@ -283,6 +315,17 @@ impl JitterBuffer {
         // store back to `retain_cap_packets` on every arrival, so a deeper target
         // is unreachable by construction and honouring it literally meant emitting
         // silence forever. The cap is the hard latency bound, so the cap wins.
+        //
+        // `Config::validate` makes the mismatch unreachable in production (the
+        // target is capped by `d_max_adaptive_ms`, which is one term of
+        // `retain_cap_packets`), hence an assertion in tests but a clamp in
+        // release: a live audio relay should not panic over a bound it can honour.
+        debug_assert!(
+            target_packets <= self.retain_cap_packets,
+            "target {} exceeds retain_cap {}",
+            target_packets,
+            self.retain_cap_packets
+        );
         let target_packets = target_packets.min(self.retain_cap_packets);
 
         // A priming buffer still below its target is emitting silence and cannot
@@ -330,6 +373,7 @@ impl JitterBuffer {
 
         if let Some((id, payload)) = self.store.remove(&next_seq) {
             self.next = Some((next_seq + 1, wrapping_next_id(id)));
+            self.abandon_upto(next_seq + 1);
             self.last_real = Some(payload.clone());
             return Released::Real(payload);
         }
@@ -337,12 +381,21 @@ impl JitterBuffer {
         let Some((oldest_seq, oldest_id)) = self.oldest() else {
             return Released::Nothing;
         };
+        // Guaranteed by the floor: nothing below the release position can be
+        // accepted, and every discard raises the floor with it.
+        debug_assert!(
+            oldest_seq >= next_seq,
+            "the store holds a slot below the release position"
+        );
         let gap = oldest_seq - next_seq;
 
         if gap as usize <= self.max_conceal_packets {
             // Conceal exactly one packet, in place, and advance by one.
             let (_, next_id) = self.next.expect("anchored");
             self.next = Some((next_seq + 1, wrapping_next_id(next_id)));
+            // The consumer has been given this slot, even though the audio was
+            // synthetic, so a straggler for it must not reopen it later.
+            self.abandon_upto(next_seq + 1);
             self.conceal_events += 1;
             return match &self.last_real {
                 Some(p) => Released::Repeat(p.clone()),
@@ -353,6 +406,7 @@ impl JitterBuffer {
         // Beyond the conceal horizon: break the timeline deliberately and count it.
         self.resync_events += 1;
         self.next = Some((oldest_seq, oldest_id));
+        self.abandon_upto(oldest_seq);
         self.release_normal(_now_ms)
     }
 
@@ -384,6 +438,13 @@ impl JitterBuffer {
                 Some(pos) => Some(pos),
                 None => last_dropped.map(|(seq, id)| (seq + 1, wrapping_next_id(id))),
             };
+            // Deliberately discarded audio: the consumer will never get those
+            // slots, so a straggler for one of them must not reopen it — that
+            // would leave a packet below the release position, which nothing
+            // downstream can express.
+            if let Some((seq, _)) = self.next {
+                self.abandon_upto(seq);
+            }
             // Discarding buffered audio breaks the timeline deliberately, so it
             // is counted like any other resync rather than being silent.
             self.resync_events += 1;
@@ -600,6 +661,70 @@ mod tests {
         assert_eq!(j.conceal_events, 0);
     }
 
+    /// The other direction of the same proxy error: a packet that *was* emitted
+    /// must not be re-admitted just because the state is Priming. The anchor is
+    /// provisional there, but the release floor is not — 99 was played, so it is
+    /// late however the anchor has since been reassigned.
+    #[test]
+    fn priming_still_refuses_a_packet_it_has_already_played() {
+        let mut j = jb();
+        j.insert(99, pkt(1), 1000);
+        assert_eq!(j.release(1010), Released::Real(pkt(1)));
+        j.release(1300); // -> Outage, floor at 100
+        j.insert(105, pkt(6), 2000); // -> Priming, anchored at 105
+        assert_eq!(j.next_id(), Some(105));
+
+        j.insert(99, pkt(9), 2001); // already played
+        assert_eq!(j.late_discards, 1, "replayed audio was re-admitted");
+        assert_eq!(j.next_id(), Some(105), "the anchor was dragged backwards");
+        assert_eq!(j.buffered(), 1);
+    }
+
+    /// A never-emitted packet must be accepted even if priming has already given
+    /// way to a *second* outage. Gating acceptance on the state left this packet
+    /// discarded as late and the buffer with no way out of Outage.
+    #[test]
+    fn a_recovery_packet_is_accepted_after_priming_falls_back_to_outage() {
+        let mut j = jb();
+        j.insert(99, pkt(1), 1000);
+        assert_eq!(j.release(1010), Released::Real(pkt(1)));
+        j.release(1300); // -> Outage
+        j.insert(101, pkt(3), 2000); // -> Priming, anchored at 101
+        assert_eq!(j.release_with_target(2010, 4), Released::Silence);
+        assert_eq!(j.release_with_target(2300, 4), Released::Silence);
+        assert_eq!(j.state(), State::Outage, "priming did not fall back");
+
+        j.insert(100, pkt(2), 2400); // never emitted
+        assert_eq!(j.late_discards, 0, "a recovery packet was discarded");
+        assert_eq!(
+            j.state(),
+            State::Priming,
+            "an arrival did not end the outage"
+        );
+        assert_eq!(j.next_id(), Some(100));
+        assert_eq!(j.release_with_target(2410, 2), Released::Real(pkt(2)));
+        assert_eq!(j.release_with_target(2420, 2), Released::Real(pkt(3)));
+    }
+
+    /// A genuine source restart must still be detected when the id it restarts to
+    /// happens to land inside the span the cold-start store covers. Widening the
+    /// reach for *vacant* slots mixed two generations of audio without counting a
+    /// resync: new id 0, four concealments, then old id 5.
+    #[test]
+    fn a_source_restart_into_the_cold_start_span_is_still_a_restart() {
+        let mut j = jb();
+        for k in 5..=20i32 {
+            j.insert(k, pkt(1), 1000);
+        }
+        assert_eq!(j.buffered(), 16);
+
+        j.insert(0, pkt(9), 1001); // 20 behind the newest, window is 16
+        assert_eq!(j.resync_events, 1, "a restart was read as a straggler");
+        assert_eq!(j.buffered(), 1, "the old generation was kept");
+        assert_eq!(j.release(1010), Released::Real(pkt(9)));
+        assert_eq!(j.conceal_events, 0, "concealed across two generations");
+    }
+
     /// A re-sent packet from the start of a cold-start burst is behind the newest
     /// by the whole length of the burst, which is more than the reorder window.
     /// Reading that as a source restart cleared all 21 buffered packets and did
@@ -620,10 +745,14 @@ mod tests {
     }
 
     /// A target deeper than the retention cap is unreachable by construction:
-    /// priming trims the store back to the cap on every arrival, so honouring the
-    /// target literally meant silence forever.
+    /// priming trims the store back to the cap on every arrival, so the buffer
+    /// used to sit in silence forever waiting for a depth it was not allowed to
+    /// hold. That pair is a programming error — `Config::validate` cannot produce
+    /// it, because the target is capped by one of the two terms of `retain_cap` —
+    /// so it is refused loudly here rather than merely clamped in silence.
     #[test]
-    fn a_target_deeper_than_the_retention_cap_does_not_wedge_the_buffer() {
+    #[should_panic(expected = "exceeds retain_cap")]
+    fn a_target_deeper_than_the_retention_cap_is_a_programming_error() {
         let mut j = JitterBuffer::new(200, 8, 200, 16, 2);
         j.insert(100, pkt(1), 1000);
         j.release(1010);
@@ -632,11 +761,21 @@ mod tests {
             j.insert(200 + k, pkt(2), 2000);
         }
         assert_eq!(j.buffered(), 2, "the retention cap was not applied");
-        assert_eq!(
-            j.release_with_target(2010, 3),
-            Released::Real(pkt(2)),
-            "an unreachable target wedged the buffer in silence"
-        );
+        j.release_with_target(2010, 3);
+    }
+
+    /// The reachable edge of the same case: a target exactly equal to the cap must
+    /// resume, not stall one packet short of a depth it can never exceed.
+    #[test]
+    fn a_target_equal_to_the_retention_cap_still_resumes() {
+        let mut j = JitterBuffer::new(200, 8, 200, 16, 2);
+        j.insert(100, pkt(1), 1000);
+        j.release(1010);
+        j.release(1300); // -> Outage
+        for k in 0..5i32 {
+            j.insert(200 + k, pkt(2), 2000);
+        }
+        assert_eq!(j.release_with_target(2010, 2), Released::Real(pkt(2)));
         assert_eq!(j.state(), State::Normal);
     }
 

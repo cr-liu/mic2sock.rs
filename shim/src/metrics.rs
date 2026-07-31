@@ -56,7 +56,10 @@ impl Metrics {
     /// Records one arrival whose delay above the running minimum was `ms`.
     pub fn record_delay(&mut self, ms: u64) {
         self.arrivals += 1;
-        let i = (ms as usize).min(BUCKETS - 1);
+        // Clamp before narrowing: `ms as usize` truncates on a 32-bit target, so
+        // `1 << 32` became 0 and an out-of-range delay was recorded as 0 ms —
+        // the opposite end of the histogram from where it belongs.
+        let i = ms.min(BUCKETS as u64 - 1) as usize;
         self.buckets[i] += 1;
     }
 
@@ -149,6 +152,47 @@ impl Metrics {
 mod tests {
     use super::*;
 
+    /// A minimal validator for this one flat shape, because there is no
+    /// serde_json here and adding it would move the lockfile. It exists because
+    /// tests that merely checked the braces and a few substrings passed a
+    /// serializer emitting `{"a":1,}` and one emitting `"step":NaN` — neither of
+    /// which any parser accepts, which defeats the point of the format.
+    fn parse_flat_json(line: &str) -> Vec<(String, String)> {
+        let body = line
+            .strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}'))
+            .unwrap_or_else(|| panic!("not a JSON object: {}", line));
+        body.split(',')
+            .map(|field| {
+                let (key, value) = field
+                    .split_once(':')
+                    .unwrap_or_else(|| panic!("not a key:value pair: {:?}", field));
+                let key = key
+                    .strip_prefix('"')
+                    .and_then(|k| k.strip_suffix('"'))
+                    .unwrap_or_else(|| panic!("unquoted key: {:?}", key));
+                let numeric = !value.is_empty()
+                    && value
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || c == '-' || c == '.');
+                assert!(
+                    value == "null" || numeric,
+                    "not a JSON number or null: {:?}",
+                    value
+                );
+                (key.to_string(), value.to_string())
+            })
+            .collect()
+    }
+
+    fn field(line: &str, key: &str) -> String {
+        parse_flat_json(line)
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+            .unwrap_or_else(|| panic!("missing {} in {}", key, line))
+    }
+
     #[test]
     fn records_into_per_millisecond_buckets() {
         let mut m = Metrics::new();
@@ -200,10 +244,16 @@ mod tests {
         assert_eq!(m.percentile_ms(100.0), 5);
     }
 
+    /// The guard has to cover the whole excluded range, not just above 100: p0 was
+    /// half of the original finding, and it returned bucket 0 whether or not
+    /// anything had been measured there.
     #[test]
-    #[should_panic(expected = "percentile must be in (0, 100]")]
-    fn a_percentile_outside_the_range_is_refused() {
-        Metrics::new().percentile_ms(101.0);
+    fn every_percentile_outside_the_range_is_refused() {
+        let m = Metrics::new();
+        for bad in [0.0, -1.0, f64::NAN, 100.1, f64::INFINITY] {
+            let refused = std::panic::catch_unwind(|| m.percentile_ms(bad)).is_err();
+            assert!(refused, "percentile_ms({}) was accepted", bad);
+        }
     }
 
     /// The derived Default left `buckets` empty, so the public constructor built
@@ -217,17 +267,18 @@ mod tests {
     }
 
     /// JSON has no NaN or Infinity literal. `{:.9}` on one produced a line that
-    /// no parser accepts, which defeats the only purpose of the format.
+    /// no parser accepts, which defeats the only purpose of the format — so this
+    /// parses the result rather than looking for substrings in it.
     #[test]
     fn a_non_finite_step_is_emitted_as_null() {
         let m = Metrics::new();
         for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let line = m.to_json_line(1, 80, bad);
-            assert!(line.contains("\"step\":null"), "{}", line);
-            for literal in ["NaN", "nan", "inf", "Inf"] {
-                assert!(!line.contains(literal), "{} leaked into {}", literal, line);
-            }
+            assert_eq!(field(&line, "step"), "null", "{}", line);
         }
+        // A finite step must still be a number, not null.
+        let line = m.to_json_line(1, 80, 1.0005);
+        assert_eq!(field(&line, "step"), "1.000500000");
     }
 
     #[test]
@@ -247,20 +298,17 @@ mod tests {
         m.catchup_overflow = 2;
         m.max_depth_hit = 1;
         let line = m.to_json_line(12_345, 80, 1.0005);
-        assert!(
-            line.starts_with('{') && line.ends_with('}'),
-            "not a JSON object: {}",
-            line
-        );
-        for needle in [
-            "\"t_ms\":12345",
-            "\"arrivals\":1",
-            "\"catchup_overflow\":2",
-            "\"max_depth_hit\":1",
-            "\"d_target_ms\":80",
-            "\"p99_9_ms\":3",
+        let fields = parse_flat_json(&line);
+        assert_eq!(fields.len(), 15, "field count changed: {}", line);
+        for (key, want) in [
+            ("t_ms", "12345"),
+            ("arrivals", "1"),
+            ("catchup_overflow", "2"),
+            ("max_depth_hit", "1"),
+            ("d_target_ms", "80"),
+            ("p99_9_ms", "3"),
         ] {
-            assert!(line.contains(needle), "missing {} in {}", needle, line);
+            assert_eq!(field(&line, key), want, "{} in {}", key, line);
         }
     }
 }

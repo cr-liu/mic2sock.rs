@@ -11,9 +11,10 @@ use std::path::{Path, PathBuf};
 /// silently ignored leaves the operator believing a setting took effect, which
 /// is the same class of confusion as the defaults-file behaviour.
 ///
-/// The invariants the rest of the program relies on — geometry bounds, whole-
-/// millisecond packets, an ordered depth chain — hold only for a value that came
-/// out of [`parse`] or [`load`]. Constructing one field by field skips them.
+/// The invariants the rest of the program relies on — the consumer's geometry, an
+/// ordered depth chain, packet counts inside every downstream horizon — hold only
+/// for a value that came out of [`parse`] or [`load`]. Building one field by field
+/// skips all of them.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -24,8 +25,9 @@ pub struct Config {
     #[serde(default = "default_sink_port")]
     pub sink_port: u16,
 
-    /// Packet geometry. Must match what the black box expects; the packet length
-    /// is derived, never hardcoded.
+    /// Packet geometry. The packet length is derived from these, never hardcoded —
+    /// but they are held to the deployed consumer's values (see `CONSUMER_*`), so
+    /// these are what the shim *reports* the geometry to be, not a free choice.
     #[serde(default = "default_n_ch")]
     pub n_ch: usize,
     #[serde(default = "default_spp_out")]
@@ -52,10 +54,10 @@ pub struct Config {
     /// Safety valve: if the consumer stops reading, discard rather than grow
     /// without bound. Should never fire in normal operation.
     ///
-    /// Must sit **above** `d_max_adaptive_ms + catchup_max_ms`, the depth the
-    /// resync anchor deliberately retains (spec §6.4). Spec §6.6's 500 ms
-    /// predates the 3 s catchup decision (§4.2) and would have made the valve
-    /// fire on every outage, discarding exactly the backlog catchup exists to
+    /// Must sit **above** `d_max_adaptive_ms + catchup_max_ms`, the ceiling on what
+    /// the resync anchor retains (spec §6.2's anchoring formula). Spec §6.6's
+    /// 500 ms predates the 3 s catchup decision (§4.2) and would have made the
+    /// valve fire on every outage, discarding exactly the backlog catchup exists to
     /// absorb.
     #[serde(default = "default_max_depth_ms")]
     pub max_depth_ms: u64,
@@ -111,19 +113,43 @@ fn default_keep_source_when_idle() -> bool {
     true
 }
 
+use crate::jitter::MAX_HORIZON_PACKETS;
 use protocol::{PacketLayout, HEADER_LEN};
 
-/// Bounds on the packet geometry. Their job is not taste but arithmetic: they
-/// are what makes `packet_len()` provably unable to overflow, and what turns a
-/// fat-fingered `n_ch` into a refusal at load rather than a wrapped frame size
-/// (`n_ch = 57646075230342349` used to parse, then wrap to a 76-byte packet).
-const MAX_N_CH: usize = 64;
-const MAX_SPP_OUT: usize = 4096;
-const MIN_SAMPLE_RATE: usize = 8_000;
-const MAX_SAMPLE_RATE: usize = 192_000;
-/// Bound on `catchup_max_ms`. Also what makes `catchup_max_packets()` provably
-/// fit a 32-bit `usize`, which a 32-bit Windows build would have.
-const MAX_CATCHUP_MS: u64 = 60_000;
+/// The geometry the deployed consumer parses.
+///
+/// Constants rather than free parameters, because the black box is closed-source
+/// and parses by byte offset: it cannot report a disagreement, it just mis-reads
+/// every field of every packet for as long as the shim runs. The three values
+/// stay in `shim.toml` so the packet length is still *derived* — 5452 is never
+/// hardcoded, per spec §6.7 — but one that disagrees with the consumer is refused
+/// at load. Changing the rig means changing these and rebuilding the consumer;
+/// that coupling is real, and naming it is more honest than accepting a geometry
+/// we cannot deliver.
+///
+/// This does not remove the need for the runtime cross-check in `source.rs`: the
+/// Pi clamps `mic.n_channel` down to whatever the hardware enumerates, so the
+/// stream can disagree with a config that is internally valid.
+const CONSUMER_N_CH: usize = 17;
+const CONSUMER_SPP_OUT: usize = 160;
+const CONSUMER_SAMPLE_RATE: usize = 16_000;
+const CONSUMER_PACKET_LEN: usize =
+    PacketLayout::new(CONSUMER_N_CH, CONSUMER_SPP_OUT, HEADER_LEN).packet_len();
+
+/// Bounds on the timing knobs. No depth in this program is ever minutes long,
+/// and bounding them is what makes every derived packet count provably fit both
+/// a 32-bit `usize` and the jitter buffer's horizon.
+const MAX_D_MAX_ADAPTIVE_MS: u64 = 1_000;
+const MAX_CATCHUP_MS: u64 = 30_000;
+const MAX_OUTAGE_THRESHOLD_MS: u64 = 10_000;
+const MAX_MAX_DEPTH_MS: u64 = 60_000;
+
+/// `max_depth_ms` dominates every other depth (validated below), and one packet
+/// is at least 1 ms, so this one bound caps every packet count the pipeline hands
+/// to `JitterBuffer::new` — which panics above its horizon. Asserted at compile
+/// time so raising a bound cannot silently produce a config that panics at
+/// startup, and so no runtime check has to pretend it might fire.
+const _: () = assert!(MAX_MAX_DEPTH_MS as usize <= MAX_HORIZON_PACKETS);
 
 /// Parses and validates a config from TOML text.
 pub fn parse(text: &str) -> Result<Config, String> {
@@ -163,55 +189,35 @@ impl Config {
 
         // Geometry. A wrong value here does not fail loudly at the far end: the
         // consumer parses by fixed byte offset, so it silently mis-reads every
-        // field of every packet for as long as the shim runs.
-        if self.header_len != HEADER_LEN {
-            return Err(format!(
-                "header_len must be {} (got {}): protocol::Header encodes at fixed offsets and \
-                 the consumer decodes the same way, so any other value shifts every field",
-                HEADER_LEN, self.header_len
-            ));
-        }
-        if !(1..=MAX_N_CH).contains(&self.n_ch) {
-            return Err(format!(
-                "n_ch must be in 1..={} (got {})",
-                MAX_N_CH, self.n_ch
-            ));
-        }
-        if !(1..=MAX_SPP_OUT).contains(&self.spp_out) {
-            return Err(format!(
-                "spp_out must be in 1..={} (got {})",
-                MAX_SPP_OUT, self.spp_out
-            ));
-        }
-        if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&self.sample_rate) {
-            return Err(format!(
-                "sample_rate must be in {}..={} (got {})",
-                MIN_SAMPLE_RATE, MAX_SAMPLE_RATE, self.sample_rate
-            ));
-        }
-        // Every depth in this program is carried in whole milliseconds, so a
-        // packet that is not a whole number of ms makes every ms<->packet
-        // conversion lossy in a way that accumulates. This also subsumes the
-        // "rounds to 0 ms" case: a sub-millisecond packet cannot be exact.
-        if self.spp_out * 1000 % self.sample_rate != 0 {
-            return Err(format!(
-                "spp_out {} at {} Hz is {:.4} ms; one packet must be a whole number of \
-                 milliseconds, because every depth here is carried in ms",
-                self.spp_out,
-                self.sample_rate,
-                self.spp_out as f64 * 1000.0 / self.sample_rate as f64
-            ));
+        // field of every packet for as long as the shim runs. `n_ch = 16` is as
+        // fatal as `header_len = 13` and just as invisible, so all four are held
+        // to the deployed values rather than merely bounded.
+        for (name, got, want) in [
+            ("header_len", self.header_len, HEADER_LEN),
+            ("n_ch", self.n_ch, CONSUMER_N_CH),
+            ("spp_out", self.spp_out, CONSUMER_SPP_OUT),
+            ("sample_rate", self.sample_rate, CONSUMER_SAMPLE_RATE),
+        ] {
+            if got != want {
+                return Err(format!(
+                    "{} must be {} (got {}): the consumer parses {}-byte packets by byte offset \
+                     and cannot report a disagreement. A different rig means changing the \
+                     CONSUMER_* constants in shim/src/config.rs and rebuilding the consumer.",
+                    name, want, got, CONSUMER_PACKET_LEN
+                ));
+            }
         }
 
         // Depth chain: target <= retained <= safety valve. Out of order, the
         // stage below discards what the stage above is waiting for.
         let packet_ms = self.packet_ms();
-        if self.d_max_adaptive_ms < 2 * packet_ms {
+        if !(2 * packet_ms..=MAX_D_MAX_ADAPTIVE_MS).contains(&self.d_max_adaptive_ms) {
             return Err(format!(
-                "d_max_adaptive_ms ({}) must be at least two packets ({} ms): two packets is the \
-                 structural floor of the buffer, so a smaller value would not be a cap at all",
-                self.d_max_adaptive_ms,
-                2 * packet_ms
+                "d_max_adaptive_ms must be in {}..={} (got {}): two packets is the structural \
+                 floor of the buffer, so anything less would not be a cap at all",
+                2 * packet_ms,
+                MAX_D_MAX_ADAPTIVE_MS,
+                self.d_max_adaptive_ms
             ));
         }
         if !(packet_ms..=MAX_CATCHUP_MS).contains(&self.catchup_max_ms) {
@@ -220,18 +226,18 @@ impl Config {
                 packet_ms, MAX_CATCHUP_MS, self.catchup_max_ms
             ));
         }
-        if self.outage_threshold_ms < packet_ms {
+        if !(packet_ms..=MAX_OUTAGE_THRESHOLD_MS).contains(&self.outage_threshold_ms) {
             return Err(format!(
-                "outage_threshold_ms ({}) must be at least one packet ({} ms)",
-                self.outage_threshold_ms, packet_ms
+                "outage_threshold_ms must be in {}..={} (got {})",
+                packet_ms, MAX_OUTAGE_THRESHOLD_MS, self.outage_threshold_ms
             ));
         }
         let retained_ms = self.d_max_adaptive_ms + self.catchup_max_ms;
-        if self.max_depth_ms < retained_ms {
+        if !(retained_ms..=MAX_MAX_DEPTH_MS).contains(&self.max_depth_ms) {
             return Err(format!(
-                "max_depth_ms ({}) must be at least d_max_adaptive_ms + catchup_max_ms ({} ms), \
-                 or the safety valve discards the backlog catchup exists to absorb",
-                self.max_depth_ms, retained_ms
+                "max_depth_ms must be in {}..={} (got {}): below d_max_adaptive_ms + \
+                 catchup_max_ms the safety valve discards the backlog catchup exists to absorb",
+                retained_ms, MAX_MAX_DEPTH_MS, self.max_depth_ms
             ));
         }
 
@@ -270,27 +276,33 @@ impl Config {
         PacketLayout::new(self.n_ch, self.spp_out, self.header_len)
     }
 
-    /// Wall duration of one output packet, in milliseconds. Exact, because
-    /// `validate` rejects a geometry whose packet is not a whole number of ms.
+    /// Wall duration of one output packet, in milliseconds. Exact and non-zero:
+    /// `validate` pins the geometry to 160 samples at 16 kHz.
     pub fn packet_ms(&self) -> u64 {
         (self.spp_out * 1000 / self.sample_rate) as u64
     }
 
     /// `catchup_max_ms` expressed in packets.
+    ///
+    /// Every count below is bounded by `MAX_MAX_DEPTH_MS` (60_000) because
+    /// `max_depth_ms` dominates the chain and `packet_ms` is at least 1, so none
+    /// of these conversions can narrow on a 32-bit build.
     pub fn catchup_max_packets(&self) -> usize {
-        // Bounded by MAX_CATCHUP_MS, so the conversion cannot narrow even on a
-        // 32-bit target; `packet_ms` is non-zero for the same reason as above.
         (self.catchup_max_ms / self.packet_ms()) as usize
     }
 
-    /// Depth the resync anchor is allowed to retain, in packets: the adaptive
-    /// target plus the catchup budget (spec §6.4). This is the jitter buffer's
-    /// `retain_cap`, and by validation it never exceeds `max_depth_ms`.
+    /// Ceiling on what the resync anchor may retain, in packets.
+    ///
+    /// Spec §6.2's anchoring formula uses the *live* `D_target + catchup_max`;
+    /// `D_target` varies at runtime, so this is its conservative maximum —
+    /// `d_max_adaptive_ms` is the cap `D_target` can never exceed. It is the
+    /// jitter buffer's `retain_cap` (a hard latency bound, so a fixed ceiling is
+    /// the right shape); trimming to the live target is the pipeline's job.
     pub fn retain_cap_packets(&self) -> usize {
         ((self.d_max_adaptive_ms + self.catchup_max_ms) / self.packet_ms()) as usize
     }
 
-    /// Safety-valve depth in packets.
+    /// Safety-valve depth in packets. Never below `retain_cap_packets()`.
     pub fn max_depth_packets(&self) -> usize {
         (self.max_depth_ms / self.packet_ms()) as usize
     }
@@ -365,15 +377,28 @@ source_port = 7998
     }
 
     /// The geometry is what the closed-source consumer parses by fixed byte
-    /// offset. `header_len = 13` produced 5453-byte packets that still parsed
-    /// here and mis-framed *every* field at the far end, forever. It is not a
-    /// free parameter: `protocol::Header` writes at hardcoded offsets.
+    /// offset, and it cannot report a disagreement — it just mis-reads every
+    /// field forever. So every value is held to the deployed rig, not merely
+    /// bounded: `n_ch = 16` (5132 bytes) is exactly as fatal as `header_len = 13`
+    /// (5453 bytes), and bounding one while allowing the other was incoherent.
     #[test]
-    fn a_header_len_other_than_twelve_is_rejected() {
-        let e = with("header_len = 13").unwrap_err();
-        assert!(e.contains("header_len must be 12"), "{}", e);
-        assert!(with("header_len = 16").is_err());
-        assert!(with("header_len = 12").is_ok(), "the real value must pass");
+    fn a_geometry_the_consumer_cannot_parse_is_rejected() {
+        for bad in [
+            "header_len = 13",
+            "header_len = 16",
+            "n_ch = 16",
+            "n_ch = 18",
+            "spp_out = 320",
+            "spp_out = 100",
+            "sample_rate = 48000",
+        ] {
+            let e = with(bad).unwrap_err();
+            assert!(e.contains("5452"), "{} -> {}", bad, e);
+        }
+        // Stating the deployed values explicitly must still parse, and the packet
+        // length must still be derived from them rather than hardcoded.
+        let c = with("header_len = 12\nn_ch = 17\nspp_out = 160\nsample_rate = 16000").unwrap();
+        assert_eq!(c.layout().packet_len(), 5452);
     }
 
     /// Unbounded geometry turned a typo into a panic (debug) or a wrapped frame
@@ -384,18 +409,21 @@ source_port = 7998
         assert!(with("n_ch = 57646075230342349").is_err());
         assert!(with("spp_out = 18446744073709552").is_err());
         assert!(with("sample_rate = 1").is_err());
-        // The bounds must still admit a plausible non-default rig.
-        let c = with("n_ch = 33\nspp_out = 480\nsample_rate = 48000").unwrap();
-        assert_eq!(c.packet_ms(), 10);
-        assert_eq!(c.layout().packet_len(), 12 + 33 * 480 * 2);
     }
 
-    /// Depths are carried in whole milliseconds throughout, so a packet of
-    /// 6.25 ms would silently truncate to 6 in every conversion.
+    /// Unbounded timing let an accepted config produce packet counts that panic
+    /// `JitterBuffer::new`, or narrow to nonsense on a 32-bit build: at
+    /// `d_max_adaptive_ms = 42949672960` the retained depth is 4.29e9 packets,
+    /// which becomes 300 in a 32-bit `usize` and inverts the validated chain.
     #[test]
-    fn a_packet_that_is_not_a_whole_millisecond_is_rejected() {
-        let e = with("spp_out = 100").unwrap_err();
-        assert!(e.contains("whole number of milliseconds"), "{}", e);
+    fn timing_beyond_its_bounds_is_rejected() {
+        assert!(with("d_max_adaptive_ms = 10485760\nmax_depth_ms = 10488760").is_err());
+        assert!(with("d_max_adaptive_ms = 42949672960\nmax_depth_ms = 85899346920").is_err());
+        assert!(with("max_depth_ms = 85899346920").is_err());
+        assert!(with("outage_threshold_ms = 99999").is_err());
+        // Every count a downstream constructor sees stays inside its horizon.
+        let c = parse(MINIMAL).unwrap();
+        assert!(c.max_depth_packets() <= MAX_HORIZON_PACKETS);
     }
 
     /// catchup_max below one packet cannot express anything useful, and above

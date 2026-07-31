@@ -22,6 +22,9 @@ pub struct DepthEstimator {
     window_ms: u64,
     /// (now_ms, d) of jitter-classified arrivals inside the window.
     samples: std::collections::VecDeque<(u64, i64)>,
+    /// Delay an on-time packet would have. See [`DepthEstimator::reference`].
+    ref_ms: Option<i64>,
+    ref_updated_ms: u64,
     target_ms: u64,
     last_shrink_ms: u64,
 }
@@ -31,6 +34,14 @@ pub struct DepthEstimator {
 pub const WINDOW_MS: u64 = 30_000;
 /// Minimum interval between one-packet shrinks of the target.
 pub const SHRINK_INTERVAL_MS: u64 = 10_000;
+/// How long the classification reference survives with no fresh samples.
+///
+/// Long enough that a *run* of late packets cannot re-baseline on itself, which
+/// is how a one-second outage reached the statistic. Short enough that drift over
+/// the interval (50 ppm × 300 s = 15 ms) stays well below the classification
+/// threshold, so a surviving reference cannot by itself flip an on-time packet
+/// into an outage.
+pub const REF_EXPIRY_MS: u64 = 10 * WINDOW_MS;
 
 impl DepthEstimator {
     /// # Panics
@@ -51,6 +62,8 @@ impl DepthEstimator {
             packet_ms,
             window_ms: WINDOW_MS,
             samples: std::collections::VecDeque::new(),
+            ref_ms: None,
+            ref_updated_ms: 0,
             target_ms: 2 * packet_ms,
             last_shrink_ms: 0,
         }
@@ -78,25 +91,19 @@ impl DepthEstimator {
 
         // Monotonic time is a precondition. If it is violated the ordering the
         // eviction loop depends on is gone, so discard the window rather than
-        // let un-evictable future-dated samples accumulate behind the front.
+        // let un-evictable future-dated samples accumulate behind the front. The
+        // shrink timestamp has to come back too: one left in the future blocks
+        // every shrink until real time catches up with it.
         if matches!(self.samples.back(), Some(&(t, _)) if t > now_ms) {
             self.samples.clear();
+            self.last_shrink_ms = now_ms;
         }
 
-        // The reference the classification is measured against must outlive
-        // eviction. When every sample has aged out, the newest of them is still
-        // the only evidence of what "on time" meant -- without it a packet
-        // delayed by a full second becomes its own minimum, reports
-        // `above_min_ms: 0`, and is filed as ordinary jitter. That was how an
-        // outage reached the statistic despite this module existing to keep it
-        // out: `observe(0, 0)` then `observe(30_001, 29_001)` evicted the
-        // baseline in the same call that needed it.
-        let stale_ref = self.samples.back().map(|&(_, d)| d);
-
-        // Evict stale samples so the statistic itself holds only fresh ones. A
-        // stale reference may still classify, but it must not contribute to the
-        // spread: over a long arrival gap it has drifted (50 ppm), and letting a
-        // drifted sample set `w` would inflate the target for nothing.
+        // Evict stale samples so the statistic holds only fresh ones. The
+        // reference deliberately survives this -- see `reference` -- but a stale
+        // sample must not contribute to the spread: over a long arrival gap it has
+        // drifted, and letting a drifted sample set `w` would inflate the target
+        // with no jitter having occurred.
         while let Some(&(t, _)) = self.samples.front() {
             if now_ms.saturating_sub(t) > self.window_ms {
                 self.samples.pop_front();
@@ -105,14 +112,7 @@ impl DepthEstimator {
             }
         }
 
-        let d_min = self
-            .samples
-            .iter()
-            .map(|&(_, d)| d)
-            .min()
-            .or(stale_ref)
-            .unwrap_or(d);
-        let above = (d - d_min).max(0) as u64;
+        let above = (d - self.reference(d, now_ms)).max(0) as u64;
 
         if above > self.d_max_adaptive_ms {
             // An outage. Deliberately NOT recorded: no buffer can cover it, and
@@ -126,6 +126,41 @@ impl DepthEstimator {
         self.recompute(now_ms);
         Arrival::Jitter {
             above_min_ms: above,
+        }
+    }
+
+    /// The delay an on-time packet would have, on the current clock offset.
+    ///
+    /// While the window has samples this is their minimum — that is what
+    /// `above_min_ms` is measured against, and it tracks drift as the window
+    /// slides. The value **persists across an arrival gap that empties the
+    /// window**, because a reference that vanishes exactly when a late packet
+    /// arrives lets that packet become its own minimum and be filed as ordinary
+    /// jitter. That is how a one-second outage used to reach the statistic, and a
+    /// *run* of late packets needs the same protection — so this is durable state
+    /// and not a value re-derived from an empty window on each call.
+    ///
+    /// The minimum, specifically, and not the newest sample: with samples at 0 and
+    /// 20 ms, a packet 90 ms above the minimum is only 70 above the newest, which
+    /// is inside the threshold. Taking the newest hides exactly the arrivals this
+    /// classification exists to catch.
+    ///
+    /// It expires after [`REF_EXPIRY_MS`], which is what stops a permanent offset
+    /// change — a sender restart with a different clock offset — from classifying
+    /// every arrival as an outage forever and freezing the target.
+    fn reference(&mut self, d: i64, now_ms: u64) -> i64 {
+        if let Some(min) = self.samples.iter().map(|&(_, d)| d).min() {
+            self.ref_ms = Some(min);
+            self.ref_updated_ms = now_ms;
+            return min;
+        }
+        match self.ref_ms {
+            Some(r) if now_ms.saturating_sub(self.ref_updated_ms) <= REF_EXPIRY_MS => r,
+            _ => {
+                self.ref_ms = Some(d);
+                self.ref_updated_ms = now_ms;
+                d
+            }
         }
     }
 
@@ -235,27 +270,102 @@ mod tests {
         assert_eq!(e.target_ms(), before, "an outage inflated the target");
     }
 
-    /// The same load-bearing behaviour, at the boundary that used to defeat it.
-    /// A stall lasting longer than the window evicts the baseline in the very
-    /// call that needs it; the late packet then became its own minimum, reported
-    /// `above_min_ms: 0`, and was filed as jitter. The next normal arrival made
-    /// the retained range 1000 ms and the target jumped to the 80 ms cap.
+    /// The same load-bearing behaviour, at the boundary that used to defeat it,
+    /// and for a *run* of late packets rather than one. A stall lasting longer
+    /// than the window evicts the baseline in the very call that needs it; each
+    /// late packet then became its own minimum, reported `above_min_ms: 0`, and
+    /// was filed as jitter, after which the next normal arrival made the retained
+    /// range 1000 ms and the target jumped to the 80 ms cap.
     #[test]
-    fn an_outage_that_outlives_the_window_is_still_excluded() {
+    fn a_sustained_outage_is_excluded_packet_after_packet() {
         let mut e = est();
         e.observe(0, 0, 0);
         assert_eq!(e.target_ms(), 20);
 
-        assert_eq!(
-            e.observe(WINDOW_MS + 1, WINDOW_MS + 1 - 1000, 0),
-            Arrival::Outage { above_min_ms: 1000 },
-            "a 1 s delay was misclassified once its reference aged out"
-        );
-        assert_eq!(e.target_ms(), 20, "an outage inflated the target");
+        for k in 0..5u64 {
+            let t = WINDOW_MS + 1 + k * 10;
+            assert_eq!(
+                e.observe(t, t - 1000, 0),
+                Arrival::Outage { above_min_ms: 1000 },
+                "late packet {} slipped in as jitter once the window emptied",
+                k
+            );
+            assert_eq!(e.target_ms(), 20, "an outage inflated the target");
+        }
 
-        // The following normal arrival must not find the outage in the window.
-        e.observe(WINDOW_MS + 11, WINDOW_MS + 11, 0);
+        // The following normal arrival must not find any of them in the window.
+        e.observe(WINDOW_MS + 101, WINDOW_MS + 101, 0);
         assert_eq!(e.target_ms(), 20, "the outage contaminated the window");
+    }
+
+    /// The surviving reference must be the windowed *minimum*, not the newest
+    /// sample. Taking the newest hides an outage: with samples at 0 and 20 ms, a
+    /// packet 90 ms above the minimum measures only 70 above the newest, lands
+    /// inside the threshold, and the next normal arrival drives the target to the
+    /// cap.
+    ///
+    /// Three arrivals, not two: the reference is captured *before* the current
+    /// sample joins the window, so with only two the last captured window holds a
+    /// single sample and its minimum and newest coincide — which would leave this
+    /// unable to tell the two rules apart.
+    #[test]
+    fn the_surviving_reference_is_the_minimum_not_the_newest() {
+        let mut e = est();
+        e.observe(1000, 1000, 0); // d = 0
+        e.observe(1010, 990, 0); // d = 20
+        e.observe(1020, 1000, 0); // captures a window whose min is 0 and newest 20
+        assert_eq!(e.target_ms(), 40);
+
+        let t = WINDOW_MS + 1021;
+        assert_eq!(
+            e.observe(t, t - 90, 0),
+            Arrival::Outage { above_min_ms: 90 },
+            "measured against the newest sample instead of the minimum"
+        );
+        e.observe(t + 10, t + 10, 0);
+        assert!(e.target_ms() <= 40, "target rose to {}", e.target_ms());
+    }
+
+    /// The reference must not be immortal either. A sender restart brings a new
+    /// clock offset; measured against the old one forever, every arrival would be
+    /// an outage and the statistic would never adapt again.
+    #[test]
+    fn a_permanently_changed_offset_re_baselines_instead_of_never_recovering() {
+        let mut e = est();
+        e.observe(0, 0, 0);
+
+        // +500 ms of offset, arriving steadily. The first is indistinguishable
+        // from an outage, and so is the one after the window has emptied.
+        let t0 = 1000;
+        assert!(matches!(e.observe(t0, t0 - 500, 0), Arrival::Outage { .. }));
+        let t1 = WINDOW_MS + 1000;
+        assert!(matches!(e.observe(t1, t1 - 500, 0), Arrival::Outage { .. }));
+
+        // Past the expiry it re-baselines, so the statistic works again.
+        let t2 = REF_EXPIRY_MS + 1001;
+        assert_eq!(
+            e.observe(t2, t2 - 500, 0),
+            Arrival::Jitter { above_min_ms: 0 },
+            "the reference never expired, so every arrival stayed an outage"
+        );
+        assert_eq!(e.target_ms(), 20);
+    }
+
+    /// Time going backwards must also reset the shrink timestamp. One left in the
+    /// future blocks every shrink until real time catches up with it, pinning the
+    /// target at its peak for a minute.
+    #[test]
+    fn a_rollback_does_not_freeze_the_target_at_its_peak() {
+        let mut e = est();
+        e.observe(100_000, 100_000, 0);
+        e.observe(100_060, 100_000, 0);
+        assert_eq!(e.target_ms(), 80);
+
+        e.observe(0, 0, 0);
+        for k in 1..=7u64 {
+            e.observe(k * SHRINK_INTERVAL_MS, k * SHRINK_INTERVAL_MS, 0);
+        }
+        assert!(e.target_ms() < 80, "target stuck at {}", e.target_ms());
     }
 
     /// The stale reference classifies, but must not enter the statistic: over a
@@ -267,7 +377,7 @@ mod tests {
         e.observe(0, 0, 0);
         // 30 ms of accumulated drift after a long gap: within the threshold, so
         // it is recorded -- but it is then the only sample, so the spread is 0.
-        let t = 10 * WINDOW_MS;
+        let t = 2 * WINDOW_MS;
         assert_eq!(
             e.observe(t, t - 30, 0),
             Arrival::Jitter { above_min_ms: 30 }
