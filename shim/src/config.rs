@@ -57,18 +57,42 @@ pub struct Config {
     pub metrics_path: Option<PathBuf>,
 }
 
-fn default_sink_port() -> u16 { 7998 }
-fn default_n_ch() -> usize { 17 }
-fn default_spp_out() -> usize { 160 }
-fn default_header_len() -> usize { 12 }
-fn default_sample_rate() -> usize { 16000 }
-fn default_d_max_adaptive_ms() -> u64 { 80 }
-fn default_catchup_max_ms() -> u64 { 3000 }
-fn default_catchup_clamp() -> f64 { 0.025 }
-fn default_catchup_slew_per_sec() -> f64 { 0.002 }
-fn default_max_depth_ms() -> u64 { 500 }
-fn default_outage_threshold_ms() -> u64 { 200 }
-fn default_keep_source_when_idle() -> bool { true }
+fn default_sink_port() -> u16 {
+    7998
+}
+fn default_n_ch() -> usize {
+    17
+}
+fn default_spp_out() -> usize {
+    160
+}
+fn default_header_len() -> usize {
+    12
+}
+fn default_sample_rate() -> usize {
+    16000
+}
+fn default_d_max_adaptive_ms() -> u64 {
+    80
+}
+fn default_catchup_max_ms() -> u64 {
+    3000
+}
+fn default_catchup_clamp() -> f64 {
+    0.025
+}
+fn default_catchup_slew_per_sec() -> f64 {
+    0.002
+}
+fn default_max_depth_ms() -> u64 {
+    500
+}
+fn default_outage_threshold_ms() -> u64 {
+    200
+}
+fn default_keep_source_when_idle() -> bool {
+    true
+}
 
 use protocol::PacketLayout;
 
@@ -226,7 +250,10 @@ source_port = 7998
     #[test]
     fn disabling_keep_source_when_idle_is_rejected_as_unimplemented() {
         let c = parse("source_host = \"h\"\nsource_port = 1\nkeep_source_when_idle = false\n");
-        assert!(c.is_err(), "an unimplemented setting must not be silently ignored");
+        assert!(
+            c.is_err(),
+            "an unimplemented setting must not be silently ignored"
+        );
         assert!(c.unwrap_err().contains("not implemented"));
     }
 }
