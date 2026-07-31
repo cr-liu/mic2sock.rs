@@ -34,6 +34,16 @@ pub enum State {
 /// appears and the modulus is exactly that.
 const ID_MODULUS: i64 = i32::MAX as i64;
 
+/// Upper bound on the accept / reorder / retain horizons.
+///
+/// Direction in a cyclic id space is only unambiguous while the horizons stay
+/// far below half the modulus: with `accept_ahead_packets = i32::MAX` a mere
+/// duplicate reads as nearly a whole modulus *ahead* and is stored a second
+/// time. `1 << 20` packets is about three hours at 100 pps — beyond any useful
+/// buffer, and still a thousandfold below `ID_MODULUS / 2`. It is also what
+/// bounds how far the cold-start store may reach below `seq_hint`.
+pub const MAX_HORIZON_PACKETS: usize = 1 << 20;
+
 /// How far forward from `from` to `to` in the sender's cyclic id space.
 ///
 /// Exact modular arithmetic rather than stepping: this needs a genuine distance
@@ -90,6 +100,20 @@ impl JitterBuffer {
         retain_cap_packets: usize,
     ) -> Self {
         assert!(retain_cap_packets > 0, "retain_cap_packets must be > 0");
+        for (name, horizon) in [
+            ("max_conceal_packets", max_conceal_packets),
+            ("accept_ahead_packets", accept_ahead_packets),
+            ("reorder_window", reorder_window),
+            ("retain_cap_packets", retain_cap_packets),
+        ] {
+            assert!(
+                horizon <= MAX_HORIZON_PACKETS,
+                "{} ({}) exceeds MAX_HORIZON_PACKETS ({})",
+                name,
+                horizon,
+                MAX_HORIZON_PACKETS
+            );
+        }
         JitterBuffer {
             store: BTreeMap::new(),
             next: None,
@@ -169,22 +193,50 @@ impl JitterBuffer {
             return;
         }
 
+        // Behind the reference. The reorder window measured from the reference is
+        // the wrong test for "did the source restart": a re-sent packet from the
+        // start of a cold-start burst is behind the *newest* by the whole length
+        // of the burst, which used to clear the entire store as if the sender had
+        // rebooted. What matters is whether the id maps into the span this buffer
+        // already covers, so the window is measured from the oldest sequence that
+        // still means anything, not from the reference.
         let behind = forward_distance(pkt_id, ref_id);
-        if behind as usize <= self.reorder_window {
-            if self.next.is_some() {
-                // Behind the release position: already emitted.
-                self.late_discards += 1;
-                return;
-            }
-            // Not anchored yet, so nothing has been released and this is not late
-            // -- just a straggler that arrived after a packet ahead of it. Place
-            // it below the reference; `seq_hint` starts at 1 << 32 precisely to
-            // leave room to go backwards.
-            match self.store.entry(ref_seq - behind) {
+        let floor_seq = self
+            .next
+            .map(|(seq, _)| seq)
+            .or_else(|| self.oldest().map(|(seq, _)| seq))
+            .unwrap_or(ref_seq);
+        // Also bounded by `ref_seq` itself, so the subtraction below cannot
+        // underflow; the sequence space starts at 1 << 32 to leave that headroom.
+        let reach = (ref_seq - floor_seq + self.reorder_window as u64).min(ref_seq);
+        if behind <= reach {
+            let seq = ref_seq - behind;
+            match self.store.entry(seq) {
+                Entry::Occupied(_) => {
+                    self.duplicate_discards += 1;
+                    return;
+                }
                 Entry::Vacant(slot) => {
+                    // Only *late* if the release position was earned by emitting
+                    // audio. While priming -- and before the first release -- it
+                    // was assigned rather than reached, so a packet behind it is a
+                    // straggler that still belongs to the timeline: nothing has
+                    // been emitted in its place, and discarding it loses that
+                    // audio for good.
+                    let emitted = match self.next {
+                        Some((next_seq, _)) => seq < next_seq && self.state != State::Priming,
+                        None => false,
+                    };
+                    if emitted {
+                        self.late_discards += 1;
+                        return;
+                    }
                     slot.insert((pkt_id, payload));
                 }
-                Entry::Occupied(_) => self.duplicate_discards += 1,
+            }
+            if self.state == State::Priming {
+                // Grow downward: the anchor follows the oldest retained packet.
+                self.reanchor_for_priming();
             }
             return;
         }
@@ -227,9 +279,23 @@ impl JitterBuffer {
     /// without consuming input), so a shallow buffer cannot deepen on its own
     /// while input and output rates are equal.
     pub fn release_with_target(&mut self, now_ms: u64, target_packets: usize) -> Released {
+        // The target cannot exceed what we are allowed to keep: priming trims the
+        // store back to `retain_cap_packets` on every arrival, so a deeper target
+        // is unreachable by construction and honouring it literally meant emitting
+        // silence forever. The cap is the hard latency bound, so the cap wins.
+        let target_packets = target_packets.min(self.retain_cap_packets);
+
+        // A priming buffer still below its target is emitting silence and cannot
+        // make progress on its own, so it is exactly as stalled as an empty one.
+        // Testing `store.is_empty()` instead left it in Priming forever while
+        // holding one packet, and the second outage went uncounted.
+        let stalled = match self.state {
+            State::Priming => self.store.len() < target_packets,
+            _ => self.store.is_empty(),
+        };
         if self.state != State::Outage
+            && stalled
             && now_ms.saturating_sub(self.last_arrival_ms) >= self.outage_threshold_ms
-            && self.store.is_empty()
             && self.next.is_some()
         {
             self.state = State::Outage;
@@ -300,15 +366,24 @@ impl JitterBuffer {
     /// failure this module exists to prevent.
     pub fn enforce_max_depth(&mut self, max_packets: usize) -> usize {
         let mut dropped = 0;
+        let mut last_dropped = None;
         while self.store.len() > max_packets {
             let oldest_seq = *self.store.keys().next().expect("non-empty");
-            self.store.remove(&oldest_seq);
+            let (id, _) = self.store.remove(&oldest_seq).expect("just located");
+            last_dropped = Some((oldest_seq, id));
             dropped += 1;
         }
         if dropped > 0 {
-            if let Some(pos) = self.oldest() {
-                self.next = Some(pos);
-            }
+            // Re-anchor past the discarded audio. When the store is left empty
+            // there is no retained oldest to anchor at, and leaving the position
+            // where it was made the next release conceal the very packets that
+            // were deliberately thrown away -- stretching the timeline by the
+            // width of the discard, with the concealment counted as if it had
+            // covered real loss.
+            self.next = match self.oldest() {
+                Some(pos) => Some(pos),
+                None => last_dropped.map(|(seq, id)| (seq + 1, wrapping_next_id(id))),
+            };
             // Discarding buffered audio breaks the timeline deliberately, so it
             // is counted like any other resync rather than being silent.
             self.resync_events += 1;
@@ -501,6 +576,118 @@ mod tests {
         }
         assert_eq!(j.release_with_target(2100, 4), Released::Real(pkt(2)));
         assert_eq!(j.state(), State::Normal);
+    }
+
+    /// During priming the release position was *assigned*, not reached: nothing
+    /// has been emitted at it. A packet landing behind it is therefore a
+    /// straggler, not a late arrival, and discarding it loses that audio for
+    /// good -- 100 used to be dropped here and 101 released in its place.
+    #[test]
+    fn priming_accepts_a_packet_behind_its_anchor() {
+        let mut j = jb();
+        j.insert(99, pkt(1), 1000);
+        assert_eq!(j.release(1010), Released::Real(pkt(1)));
+        j.release(1300); // -> Outage, the position frozen at 100
+        j.insert(101, pkt(3), 2000); // -> Priming, anchored at 101
+        assert_eq!(j.state(), State::Priming);
+
+        j.insert(100, pkt(2), 2001); // one behind the priming anchor
+        assert_eq!(j.late_discards, 0, "a straggler was discarded as late");
+        assert_eq!(j.next_id(), Some(100), "the anchor did not grow downward");
+        assert_eq!(j.buffered(), 2);
+        assert_eq!(j.release_with_target(2010, 2), Released::Real(pkt(2)));
+        assert_eq!(j.release_with_target(2020, 2), Released::Real(pkt(3)));
+        assert_eq!(j.conceal_events, 0);
+    }
+
+    /// A re-sent packet from the start of a cold-start burst is behind the newest
+    /// by the whole length of the burst, which is more than the reorder window.
+    /// Reading that as a source restart cleared all 21 buffered packets and did
+    /// not even count the duplicate.
+    #[test]
+    fn a_resent_packet_from_the_start_of_a_burst_is_not_a_source_restart() {
+        let mut j = jb();
+        for k in 0..21i32 {
+            j.insert(100 + k, pkt(1), 1000);
+        }
+        assert_eq!(j.buffered(), 21);
+
+        j.insert(100, pkt(9), 1001); // 20 behind the newest, window is 16
+        assert_eq!(j.buffered(), 21, "the whole burst was discarded");
+        assert_eq!(j.duplicate_discards, 1, "the duplicate was not counted");
+        assert_eq!(j.resync_events, 0, "a duplicate was read as a restart");
+        assert_eq!(j.release(1010), Released::Real(pkt(1)));
+    }
+
+    /// A target deeper than the retention cap is unreachable by construction:
+    /// priming trims the store back to the cap on every arrival, so honouring the
+    /// target literally meant silence forever.
+    #[test]
+    fn a_target_deeper_than_the_retention_cap_does_not_wedge_the_buffer() {
+        let mut j = JitterBuffer::new(200, 8, 200, 16, 2);
+        j.insert(100, pkt(1), 1000);
+        j.release(1010);
+        j.release(1300); // -> Outage
+        for k in 0..5i32 {
+            j.insert(200 + k, pkt(2), 2000);
+        }
+        assert_eq!(j.buffered(), 2, "the retention cap was not applied");
+        assert_eq!(
+            j.release_with_target(2010, 3),
+            Released::Real(pkt(2)),
+            "an unreachable target wedged the buffer in silence"
+        );
+        assert_eq!(j.state(), State::Normal);
+    }
+
+    /// Discarding every stored packet must move the release position past them.
+    /// Leaving it behind made the next release conceal the very audio that was
+    /// deliberately thrown away, counting it as if it had covered real loss.
+    #[test]
+    fn max_depth_zero_re_anchors_past_everything_it_discarded() {
+        let mut j = jb();
+        j.insert(100, pkt(1), 1000);
+        assert_eq!(j.release(1010), Released::Real(pkt(1)));
+        for k in 1..=5i32 {
+            j.insert(100 + k, pkt(2), 1000 + k as u64);
+        }
+
+        assert_eq!(j.enforce_max_depth(0), 5);
+        assert_eq!(
+            j.next_id(),
+            Some(106),
+            "the anchor stayed behind the discards"
+        );
+        j.insert(106, pkt(6), 1100);
+        assert_eq!(j.release(1110), Released::Real(pkt(6)));
+        assert_eq!(j.conceal_events, 0, "reconcealed audio it had discarded");
+    }
+
+    /// A priming buffer that cannot reach its target is emitting silence and
+    /// cannot progress on its own, so a further silence past the threshold is
+    /// another outage and must be counted as one.
+    #[test]
+    fn priming_re_enters_outage_when_arrivals_stop_again() {
+        let mut j = jb();
+        j.insert(100, pkt(1), 1000);
+        j.release(1010);
+        j.release(1300); // -> Outage
+        assert_eq!(j.outage_events, 1);
+
+        j.insert(200, pkt(2), 2000); // -> Priming, holding one packet
+        assert_eq!(j.release_with_target(2010, 4), Released::Silence);
+        assert_eq!(j.release_with_target(2300, 4), Released::Silence);
+        assert_eq!(j.state(), State::Outage, "priming never re-entered outage");
+        assert_eq!(j.outage_events, 2);
+        assert_eq!(j.buffered(), 1, "the held packet was thrown away");
+    }
+
+    /// Horizons near half the modulus make direction ambiguous: a duplicate then
+    /// reads as almost a whole modulus *ahead* and is stored a second time.
+    #[test]
+    #[should_panic(expected = "exceeds MAX_HORIZON_PACKETS")]
+    fn an_accept_horizon_near_half_the_modulus_is_refused() {
+        JitterBuffer::new(200, 8, i32::MAX as usize, 16, 12);
     }
 
     /// A gap larger than is worth concealing breaks the timeline deliberately; it
