@@ -45,6 +45,16 @@ pub enum SourceEvent {
 /// consumer it has to match is closed-source. Bounded to a handful of packets: enough
 /// that a coincidental match is implausible, small enough not to delay startup or
 /// keep re-checking a stream that has already proven itself.
+///
+/// The check is **fatal**, so "advances by exactly 1" had better not have legitimate
+/// exceptions. It does not, and that is a fact about the sender rather than a hope:
+/// `mic2sock`'s `SocketHandler::run` does `self.pkt_receiver.recv().await?` on a
+/// `broadcast` channel of capacity 16, so a client that falls behind is answered with
+/// `Lagged` and the `?` **drops the connection** — it is never served a stream with
+/// ids skipped. Within one connection the sequence is therefore contiguous, and across
+/// connections this check restarts, so a sender that legitimately restarted its ids is
+/// not flagged. (The `ms` bound is likewise the sender's own: it borrows from `secs`
+/// when back-dating would make `ms` negative, so `ms` is always in `0..1000`.)
 const GEOMETRY_CHECK_PACKETS: usize = 8;
 
 /// Reassembles a fixed-size packet stream from a byte stream.
