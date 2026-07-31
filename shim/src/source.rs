@@ -120,10 +120,15 @@ impl GeometryCheck {
         }
     }
 
+    /// Whether the whole validation window has been seen and accepted.
+    fn passed(&self) -> bool {
+        self.checked >= GEOMETRY_CHECK_PACKETS
+    }
+
     /// Validates one more packet, if the budget in [`GEOMETRY_CHECK_PACKETS`] is not
     /// already spent. Returns a description of the mismatch on failure.
     fn check(&mut self, pkt: &Bytes) -> Result<(), String> {
-        if self.checked >= GEOMETRY_CHECK_PACKETS {
+        if self.passed() {
             return Ok(());
         }
         let h = match Header::parse(pkt) {
@@ -141,6 +146,17 @@ impl GeometryCheck {
                 "source geometry mismatch: header ms={} is not a millisecond value \
                  (pkt_id={}); check n_ch / spp_out",
                 h.ms, h.pkt_id
+            ));
+        }
+        // `i32::MAX` is outside the sender's id space, so a stream carrying it is
+        // malformed. Rejected before it can reach the successor arithmetic below, where
+        // `prev + 1` would overflow and panic the source task in a debug build --
+        // bypassing the fatal path this check exists to take.
+        if h.pkt_id == i32::MAX || h.pkt_id < 0 {
+            return Err(format!(
+                "source geometry mismatch: pkt_id {} is outside the sender's id space \
+                 (0..i32::MAX); check n_ch / spp_out",
+                h.pkt_id
             ));
         }
         if let Some(prev) = self.last_pkt_id {
@@ -223,6 +239,19 @@ impl TcpSource {
         let mut framer = Framer::new(self.pkt_len);
         let mut geometry = GeometryCheck::new();
         let mut chunk = vec![0u8; self.pkt_len.min(65536)];
+        // One frame of lookahead while the window is being validated. The first frame of
+        // a mis-configured stream is the start of a real packet followed by the head of
+        // the next, so its leading header parses and looks perfectly fine -- the
+        // mismatch only shows up in the frame after. Forwarding as we checked therefore
+        // let malformed audio reach the consumer, with the fatal exit merely racing it.
+        //
+        // One frame is enough: a frame is released once the *next* one has confirmed the
+        // id step, so every delivered packet has been confirmed, and the window still
+        // spans all `GEOMETRY_CHECK_PACKETS`. Holding the whole window instead would
+        // delay startup and every reconnect by 80 ms for no extra detection. A
+        // connection that closes mid-window loses the one held packet, which is correct:
+        // its geometry was never proved.
+        let mut held: Option<Bytes> = None;
         loop {
             let n = match time::timeout(self.read_timeout, sock.read(&mut chunk)).await {
                 Err(_) => {
@@ -240,8 +269,19 @@ impl TcpSource {
                 if let Err(msg) = geometry.check(&p) {
                     return Err(PumpError::Fatal(msg));
                 }
-                if tx.send(SourceEvent::Packet(p)).await.is_err() {
-                    return Ok(()); // pipeline shut down
+                if geometry.passed() {
+                    if let Some(prev) = held.take() {
+                        if tx.send(SourceEvent::Packet(prev)).await.is_err() {
+                            return Ok(()); // pipeline shut down
+                        }
+                    }
+                    if tx.send(SourceEvent::Packet(p)).await.is_err() {
+                        return Ok(());
+                    }
+                } else if let Some(confirmed) = held.replace(p) {
+                    if tx.send(SourceEvent::Packet(confirmed)).await.is_err() {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -351,7 +391,10 @@ mod tests {
 
         tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
-            for id in 0i32..3 {
+            // A full validation window and one more: while validating, a frame is only
+            // released once the next has confirmed its id step, so a stream shorter than
+            // the window legitimately delivers nothing.
+            for id in 0i32..(GEOMETRY_CHECK_PACKETS as i32 + 1) {
                 sock.write_all(&header_packet(id, id as i16)).await.unwrap();
             }
             // Hold the connection open briefly so the reader drains.
@@ -369,7 +412,7 @@ mod tests {
                 .expect("channel closed"),
             SourceEvent::Connected
         );
-        for id in 0i32..3 {
+        for id in 0i32..(GEOMETRY_CHECK_PACKETS as i32 + 1) {
             let got = time::timeout(Duration::from_secs(3), rx.recv())
                 .await
                 .expect("timed out")
@@ -444,10 +487,16 @@ mod tests {
 
         tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
-            sock.write_all(&header_packet(i32::MAX - 1, 0))
-                .await
-                .unwrap();
-            sock.write_all(&header_packet(0, 1)).await.unwrap();
+            // A whole validation window straddling the wrap, plus one, so that the
+            // released stream actually crosses it: the successor of i32::MAX - 1 is 0.
+            for k in 0i32..4 {
+                sock.write_all(&header_packet(i32::MAX - 4 + k, 0))
+                    .await
+                    .unwrap();
+            }
+            for k in 0i32..5 {
+                sock.write_all(&header_packet(k, 1)).await.unwrap();
+            }
             time::sleep(Duration::from_millis(200)).await;
         });
 
@@ -456,14 +505,22 @@ mod tests {
         tokio::spawn(src.run(tx));
 
         assert_eq!(rx.recv().await.unwrap(), SourceEvent::Connected);
-        assert_eq!(
-            rx.recv().await.unwrap(),
-            SourceEvent::Packet(Bytes::copy_from_slice(&header_packet(i32::MAX - 1, 0)))
-        );
-        assert_eq!(
-            rx.recv().await.unwrap(),
-            SourceEvent::Packet(Bytes::copy_from_slice(&header_packet(0, 1)))
-        );
+        for k in 0i32..4 {
+            assert_eq!(
+                rx.recv().await.unwrap(),
+                SourceEvent::Packet(Bytes::copy_from_slice(&header_packet(i32::MAX - 4 + k, 0))),
+                "before the wrap, {}",
+                k
+            );
+        }
+        for k in 0i32..5 {
+            assert_eq!(
+                rx.recv().await.unwrap(),
+                SourceEvent::Packet(Bytes::copy_from_slice(&header_packet(k, 1))),
+                "after the wrap, {}",
+                k
+            );
+        }
     }
 
     /// Checking is bounded to the first [`GEOMETRY_CHECK_PACKETS`] packets, so a
@@ -515,12 +572,18 @@ mod tests {
         tokio::spawn(async move {
             {
                 let (mut sock, _) = listener.accept().await.unwrap();
-                sock.write_all(&header_packet(5000, 0)).await.unwrap();
+                // A full window plus one, so the validated stream is actually released:
+                // while validating, a frame waits for the next to confirm its id step.
+                for k in 0i32..(GEOMETRY_CHECK_PACKETS as i32 + 1) {
+                    sock.write_all(&header_packet(5000 + k, 0)).await.unwrap();
+                }
                 // Socket drops here, closing connection 1 (EOF for the client).
             }
             let (mut sock, _) = listener.accept().await.unwrap();
-            // Id 0 would be a huge backward jump from 5000 if state carried over.
-            sock.write_all(&header_packet(0, 1)).await.unwrap();
+            // Id 0 would be a huge backward jump from 5008 if state carried over.
+            for k in 0i32..(GEOMETRY_CHECK_PACKETS as i32 + 1) {
+                sock.write_all(&header_packet(k, 1)).await.unwrap();
+            }
             time::sleep(Duration::from_millis(200)).await;
         });
 
@@ -534,10 +597,12 @@ mod tests {
             SourceEvent::Connected,
             "connection 1"
         );
-        assert_eq!(
-            rx.recv().await.unwrap(),
-            SourceEvent::Packet(Bytes::copy_from_slice(&header_packet(5000, 0)))
-        );
+        for k in 0i32..(GEOMETRY_CHECK_PACKETS as i32 + 1) {
+            assert_eq!(
+                rx.recv().await.unwrap(),
+                SourceEvent::Packet(Bytes::copy_from_slice(&header_packet(5000 + k, 0)))
+            );
+        }
         assert_eq!(
             time::timeout(Duration::from_secs(3), rx.recv())
                 .await

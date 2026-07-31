@@ -3,16 +3,27 @@
 //! Lives in the library rather than in `main.rs` so an integration test can drive it
 //! directly; a binary crate's modules cannot be reached from `tests/`.
 //!
-//! **The release rate is the consumer's read rate.** There is no timer in this loop.
-//! One packet is released per accepted sink write, and every channel between here and
-//! the socket is deliberately tiny, so `send().await` returns only once the consumer
-//! has actually taken the previous packet. Windows' default timer granularity is
+//! **The release rate is the consumer's read rate.** There is no timer in this loop:
+//! one packet is released per accepted sink write. Windows' default timer granularity is
 //! 15.6 ms against a 10 ms packet, so a timer-driven design would add more jitter than
 //! the network does.
+//!
+//! Be precise about what that bounds, though. `send().await` returns when the sink task
+//! *dequeues*, and its `write_all` returns when the local TCP stack accepts the bytes —
+//! not when the consumer application reads them. Between the two-slot channel, the
+//! packet in the sink's write, and both kernel buffers (Linux doubled a 16 KB
+//! `SO_SNDBUF` request to 32 KB), a measured 11 packets — about 110 ms — crossed while a
+//! consumer read nothing. So this bounds the lead to a few packets rather than the three
+//! seconds a large queue would allow; it does not make a release equal a consumer read.
+//!
+//! It also assumes the consumer reads at its own audio rate. A consumer that reads flat
+//! out *is* the clock, and will be served flat out — the code cannot tell "feeding a
+//! bounded device queue" from "draining as fast as possible". That assumption holds for
+//! an audio consumer and has to be confirmed against the real one.
 
 use crate::config::Config;
 use crate::depth::{Arrival, DepthEstimator};
-use crate::jitter::{JitterBuffer, Released};
+use crate::jitter::{JitterBuffer, Released, State as JitterState};
 use crate::metrics::Metrics;
 use crate::reframe::Reframer;
 use crate::sink::Sink;
@@ -21,6 +32,7 @@ use bytes::Bytes;
 use clocksync::DepthController;
 use protocol::Header;
 use std::io::Write;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
@@ -69,13 +81,62 @@ pub async fn run(cfg: Config) {
     run_with_sink(cfg, sink).await
 }
 
+/// Handles one source event.
+///
+/// A free function rather than inline, because the generation reset has to be applied
+/// *within* the event that proved it: `jb.insert` is what detects an id reset, and
+/// deferring the reset until the whole ready batch had been drained meant a hundred
+/// packets of a restarted sender were first classified against the old clock offset —
+/// and then thrown away by the reset that followed.
+fn on_event(
+    ev: SourceEvent,
+    t: u64,
+    jb: &mut JitterBuffer,
+    est: &mut DepthEstimator,
+    m: &mut Metrics,
+    generation_resets_seen: &mut u64,
+    timeline_reset_due: &mut bool,
+) {
+    match ev {
+        SourceEvent::Connected => {
+            // Every connect, including the first. This is the only evidence that a
+            // backward packet-id jump is a sender restart rather than a replay of audio
+            // already emitted, and it has to arrive in order with the packets around it
+            // — hence travelling through the same channel.
+            jb.on_source_reconnect();
+        }
+        SourceEvent::Packet(pkt) => {
+            if let Some(h) = Header::parse(&pkt) {
+                let header_ms = h.secs as u64 * 1000 + h.ms.max(0) as u64;
+                jb.insert(h.pkt_id, pkt, t);
+                // A *proven* id reset — not a mere reconnect — means a new sender
+                // process and so possibly a new clock offset, which is the only thing
+                // that justifies discarding the delay statistic. An ordinary reconnect
+                // must not: the first packet after a stall is the most delayed one, and
+                // with no reference left to measure it against it would become its own
+                // baseline. Checked before observing, so this packet is the first
+                // sample of the new generation rather than the last of the old.
+                if jb.generation_resets != *generation_resets_seen {
+                    *generation_resets_seen = jb.generation_resets;
+                    est.on_generation_reset();
+                    *timeline_reset_due = true;
+                }
+                match est.observe(t, header_ms, 0) {
+                    Arrival::Jitter { above_min_ms } => m.record_delay(above_min_ms),
+                    Arrival::Outage { .. } => m.outage_events += 1,
+                }
+            }
+        }
+    }
+}
+
 /// Runs against an already-bound sink.
 ///
 /// Split out so a test can bind port 0 itself, read back the assigned port, and pass
-/// the listener in. Taking a port *number* instead would leave a window between
-/// finding a free port and binding it — with several tests in one binary that is a
-/// real race, not a theoretical one — and would also mean a test process could be
-/// killed by this module's `exit` on a bind failure.
+/// the listener in. Taking a port *number* instead would leave a window between finding
+/// a free port and binding it — with several tests in one binary that is a real race,
+/// not a theoretical one — and would also mean a test process could be killed by this
+/// module's `exit` on a bind failure.
 pub async fn run_with_sink(cfg: Config, sink: Sink) {
     // The input geometry matches the output for now: the Pi's sample_per_packet is
     // only reduced in a later phase, and the reframer does not require the two to
@@ -100,6 +161,7 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
             std::process::exit(EXIT_GEOMETRY);
         }
     });
+    let connected = sink.connected();
     tokio::spawn(sink.run(sink_rx));
 
     let packet_ms = cfg.packet_ms();
@@ -122,41 +184,57 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
     let mut last_ctl_ms = 0u64;
     let mut pending: Vec<Bytes> = Vec::new();
     let mut generation_resets_seen = 0u64;
+    let mut timeline_reset_due = false;
 
     loop {
+        let target_packets = (est.target_ms() / packet_ms) as usize;
+
+        // With no consumer there is no release clock, so releasing would only feed the
+        // sink's discard — and arrive at the moment the consumer connects with an empty
+        // buffer, which is the opposite of the point. Hold a rolling window of the
+        // current target instead (spec §6.5) and wait for the next arrival. Waiting on
+        // the channel rather than polling is also what keeps this off a timer.
+        if !connected.load(Ordering::Relaxed) {
+            jb.enforce_max_depth(target_packets.max(1));
+            match src_rx.recv().await {
+                Some(ev) => {
+                    let t = start.elapsed().as_millis() as u64;
+                    on_event(
+                        ev,
+                        t,
+                        &mut jb,
+                        &mut est,
+                        &mut m,
+                        &mut generation_resets_seen,
+                        &mut timeline_reset_due,
+                    );
+                }
+                None => return,
+            }
+            continue;
+        }
+
         // Take everything that has arrived without blocking, so the jitter buffer
         // sees arrivals promptly and in order.
         while let Ok(event) = src_rx.try_recv() {
             let t = start.elapsed().as_millis() as u64;
-            match event {
-                SourceEvent::Connected => {
-                    // Every connect, including the first. This is the only evidence
-                    // that a backward packet-id jump is a sender restart rather than a
-                    // replay of audio already emitted, and it has to arrive in order
-                    // with the packets — hence travelling through this channel.
-                    jb.on_source_reconnect();
-                }
-                SourceEvent::Packet(pkt) => {
-                    if let Some(h) = Header::parse(&pkt) {
-                        let header_ms = h.secs as u64 * 1000 + h.ms.max(0) as u64;
-                        match est.observe(t, header_ms, 0) {
-                            Arrival::Jitter { above_min_ms } => m.record_delay(above_min_ms),
-                            Arrival::Outage { .. } => m.outage_events += 1,
-                        }
-                        jb.insert(h.pkt_id, pkt, t);
-                    }
-                }
-            }
+            on_event(
+                event,
+                t,
+                &mut jb,
+                &mut est,
+                &mut m,
+                &mut generation_resets_seen,
+                &mut timeline_reset_due,
+            );
         }
 
-        // A *proven* id reset — not a mere reconnect — means a new sender process and
-        // so possibly a new clock offset, which is the only thing that justifies
-        // throwing away the delay statistic. An ordinary reconnect must not: the first
-        // packet after a stall is the most delayed one, and with no reference left to
-        // measure it against it would become its own baseline.
-        if jb.generation_resets != generation_resets_seen {
-            generation_resets_seen = jb.generation_resets;
-            est.on_generation_reset();
+        if timeline_reset_due {
+            // A proven sender restart is the one case where the output timestamps
+            // should jump rather than stay monotonic: the new process may be on a
+            // different clock.
+            timeline_reset_due = false;
+            refr.reset_timeline();
         }
 
         let dropped = jb.enforce_max_depth(max_depth_packets);
@@ -165,9 +243,18 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
             eprintln!("shim: max_depth exceeded, discarded {} packets", dropped);
         }
 
-        // The depth controller runs on wall time, not per packet.
+        // The depth controller runs on wall time, not per packet — and only while the
+        // buffer is actually releasing real audio. During an outage or while priming,
+        // zero occupancy does not mean "play slower": the real timeline is frozen and
+        // what is going out is synthetic. Taking the error from it slewed `step` all
+        // the way down to the lower clamp over a 12.5 s outage, so recovery began by
+        // running *backwards* — occupancy then grew by another 150 ms and a backlog
+        // that was exactly within the lossless budget tripped the overflow trim.
         let t = start.elapsed().as_millis() as u64;
-        if t.saturating_sub(last_ctl_ms) >= packet_ms {
+        if jb.state() != JitterState::Normal {
+            last_ctl_ms = t;
+        }
+        if jb.state() == JitterState::Normal && t.saturating_sub(last_ctl_ms) >= packet_ms {
             let dt = (t - last_ctl_ms) as f64 / 1000.0;
             last_ctl_ms = t;
             let measured_ms = jb.buffered() as u64 * packet_ms;
@@ -188,7 +275,6 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
         }
 
         // One release per accepted write: the consumer paces this.
-        let target_packets = (est.target_ms() / packet_ms) as usize;
         let now = start.elapsed().as_millis() as u64;
         match jb.release_with_target(now, target_packets) {
             Released::Real(p) => refr.push_audible(&p),
@@ -196,7 +282,9 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
                 m.conceal_events += 1;
                 m.conceal_samples += in_layout.spp as u64;
                 est.on_conceal(now);
-                refr.push_packet(&p);
+                // Not `push_packet`: the audio is a repeat, so its header names a time
+                // that has already been emitted and must not anchor the timeline.
+                refr.push_repeat(&p);
             }
             Released::Silence => refr.push_silence(),
             Released::Nothing => {

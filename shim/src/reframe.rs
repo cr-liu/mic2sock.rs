@@ -11,11 +11,17 @@ use protocol::{Header, PacketLayout};
 /// the input and output samples-per-packet need not divide each other — the
 /// reblocker simply accumulates.
 ///
-/// The resampler is a 4-point Catmull-Rom interpolator, so it always holds
-/// exactly three samples of history in its taps — a fixed, one-time 0.19 ms
-/// warm-up at 16 kHz, not a per-packet loss: those samples come out as soon as
-/// more input arrives. It is identical across channels, so it cannot disturb
+/// The resampler is a 4-point Catmull-Rom interpolator, so it always holds exactly three
+/// samples of history in its taps — a fixed, one-time 0.19 ms warm-up at 16 kHz rather
+/// than a per-packet loss. It is identical across channels, so it cannot disturb
 /// inter-channel phase, which is the one property this module has to preserve.
+///
+/// One caveat on "warm-up rather than loss": the kernel starts between taps 1 and 2, so
+/// the very first input sample of a stream is never emitted — output begins at input
+/// sample 1. Every channel is shifted alike and every later boundary is contiguous, so
+/// nothing drifts and nothing further is lost; it is a single sample at the head of the
+/// stream, 62 µs, and priming the taps to recover it would mean interpolating real audio
+/// against invented zeros.
 ///
 /// Output timestamps are the shim's own continuous timeline: anchored to the
 /// earliest input packet that has contributed since the last frame, and extrapolated
@@ -92,6 +98,19 @@ impl Reframer {
         (h.secs as i64 * 1000 + h.ms as i64).max(0) as u64
     }
 
+    /// Feeds one input packet's audio, without letting it anchor the output timeline.
+    ///
+    /// For concealment: the audio is a *repeat* of a packet already emitted, so its
+    /// header names a time that has passed and must not anchor the output timeline.
+    ///
+    /// Strictly this is belt-and-braces — a repeat's stamp is always behind where output
+    /// has reached, so `drain`'s monotonic rule would reject it anyway, and no test can
+    /// tell the two apart. It stays because the intent belongs at the call site rather
+    /// than resting on arithmetic three functions away.
+    pub fn push_repeat(&mut self, packet: &[u8]) {
+        self.push_samples(packet);
+    }
+
     /// Feeds one input packet's audio into the resampler.
     pub fn push_packet(&mut self, packet: &[u8]) {
         if let Some(h) = Header::parse(packet) {
@@ -104,6 +123,10 @@ impl Reframer {
         if self.pending_header.is_none() {
             self.pending_header = Header::parse(packet);
         }
+        self.push_samples(packet);
+    }
+
+    fn push_samples(&mut self, packet: &[u8]) {
         if self.scratch.len() != self.in_layout.spp {
             self.scratch = vec![0i16; self.in_layout.spp];
         }
@@ -111,6 +134,16 @@ impl Reframer {
             deblock_channel(packet, &self.in_layout, c, &mut self.scratch);
             self.resampler.push(c, &self.scratch);
         }
+    }
+
+    /// Forgets the output timeline, so the next real packet re-anchors it.
+    ///
+    /// Called on a proven sender restart: a new sender process may have a different
+    /// clock, and that is the one case where the output timestamps *should* jump rather
+    /// than stay monotonic.
+    pub fn reset_timeline(&mut self) {
+        self.next_out_ts_ms = 0;
+        self.pending_header = None;
     }
 
     /// Feeds one input packet's worth of silence, and aims the fade at zero.
@@ -168,9 +201,16 @@ impl Reframer {
             // the timeline is *extrapolated* rather than left at zero. Borrowing a
             // zeroed header there put 1970 on every silence packet and on roughly
             // every fortieth packet at the ordinary drift-correcting step.
-            let ts_ms = match self.pending_header.take() {
-                Some(h) => Self::header_ms(&h),
-                None => self.next_out_ts_ms,
+            // Monotonic: an anchor is only taken if it does not move the timeline
+            // backwards. Extrapolation can outrun the input — during an outage, or
+            // whenever the consumer reads faster than the sender sends — and snapping
+            // back to a fresher-but-older input stamp made the sequence go backwards by
+            // as much as it had run ahead. A genuine clock change comes with a proven
+            // sender restart, and `reset_timeline` is how that one is expressed.
+            let anchor = self.pending_header.take().map(|h| Self::header_ms(&h));
+            let ts_ms = match anchor {
+                Some(ts) if ts >= self.next_out_ts_ms => ts,
+                _ => self.next_out_ts_ms,
             };
             self.next_out_ts_ms = ts_ms + self.out_packet_ms;
             Header {
@@ -417,6 +457,104 @@ mod tests {
                 stamps[i - 1] + 10,
                 "silence packet {} did not continue the timeline",
                 i
+            );
+        }
+    }
+
+    /// Extrapolation can outrun the input — during an outage, or whenever the consumer
+    /// reads faster than the sender sends — and a fresher-but-older input stamp must not
+    /// snap the sequence back. Measured at 1000 concealed packets ahead, where an
+    /// unguarded anchor rolled the timeline back by nearly ten seconds.
+    #[test]
+    fn a_real_header_never_moves_the_timeline_backwards() {
+        let (li, lo) = layouts(160, 160);
+        let mut r = Reframer::new(li, lo, 5, 16000, 20);
+        let mut out = Vec::new();
+        let stamped = |ms: i16, id: i32| {
+            let mut buf = vec![0u8; li.packet_len()];
+            Header {
+                device_id: 5,
+                secs: 100,
+                ms,
+                pkt_id: id,
+            }
+            .write_to(&mut buf);
+            Bytes::from(buf)
+        };
+
+        for k in 0..4i32 {
+            r.push_packet(&stamped((k * 10) as i16, k));
+            r.drain(1.0, &mut out);
+        }
+        // Run the timeline a long way ahead on concealment alone.
+        for _ in 0..200 {
+            r.push_silence();
+            r.drain(1.0, &mut out);
+        }
+        let ahead = Header::parse(out.last().unwrap()).unwrap();
+        let ahead_ms = ahead.secs as u64 * 1000 + ahead.ms as u64;
+
+        // Now a real packet whose own timestamp is far behind where output has reached.
+        r.push_packet(&stamped(40, 4));
+        r.drain(1.0, &mut out);
+        let after = Header::parse(out.last().unwrap()).unwrap();
+        let after_ms = after.secs as u64 * 1000 + after.ms as u64;
+        assert!(
+            after_ms > ahead_ms,
+            "the timeline snapped backwards: {} then {}",
+            ahead_ms,
+            after_ms
+        );
+    }
+
+    /// Concealment replays audio that has already been emitted, so its header names a
+    /// time that has passed. Letting it anchor the timeline stamped the concealed packet
+    /// with that old time — a duplicate of an earlier stamp, and a step backwards once
+    /// extrapolation had moved on. The consumer parses this field.
+    #[test]
+    fn a_repeat_does_not_anchor_the_timeline_to_replayed_audio() {
+        let (li, lo) = layouts(160, 160);
+        let mut r = Reframer::new(li, lo, 5, 16000, 20);
+        let mut out = Vec::new();
+
+        let mut inputs: Vec<Bytes> = Vec::new();
+        for k in 0..6i32 {
+            let mut buf = vec![0u8; li.packet_len()];
+            Header {
+                device_id: 5,
+                secs: 100,
+                ms: (k * 10) as i16,
+                pkt_id: k,
+            }
+            .write_to(&mut buf);
+            let buf = Bytes::from(buf);
+            inputs.push(buf.clone());
+            r.push_packet(&buf);
+            r.drain(1.0, &mut out);
+        }
+        let real = out.len();
+        assert!(real >= 2);
+
+        // Conceal by replaying the first input, whose header is far in the past.
+        for _ in 0..3 {
+            r.push_repeat(&inputs[0]);
+            r.drain(1.0, &mut out);
+        }
+        assert!(out.len() > real, "no concealed packet was produced");
+
+        let stamps: Vec<u64> = out
+            .iter()
+            .map(|p| {
+                let h = Header::parse(p).unwrap();
+                h.secs as u64 * 1000 + h.ms as u64
+            })
+            .collect();
+        for i in 1..stamps.len() {
+            assert!(
+                stamps[i] > stamps[i - 1],
+                "timeline stalled or went backwards at {}: {:?}",
+                i,
+                stamps
             );
         }
     }

@@ -135,7 +135,12 @@ impl JitterBuffer {
             floor_seq: None,
             generation_may_reset: false,
             seq_hint: 1 << 32,
-            state: State::Normal,
+            // Starts priming, not normal. Occupancy only grows by concealing, so a
+            // buffer that begins releasing on its first arrival stays pinned at zero
+            // depth for as long as input and output rates match — it would forward the
+            // burstiness it exists to absorb. The target gate is exactly the wait that
+            // cold start needs, and it is already implemented for outage recovery.
+            state: State::Priming,
             last_real: None,
             last_arrival_ms: 0,
             outage_threshold_ms,
@@ -399,8 +404,17 @@ impl JitterBuffer {
             // reopened by a straggler that arrives for one of them later.
             self.abandon_upto(oldest_seq + 1);
         }
-        if let Some((seq, id)) = self.oldest() {
-            self.next = Some((seq, id));
+        // Re-anchor only if there is an anchor to correct. After an outage the old
+        // release position is stale and has to follow the retained audio. At cold start
+        // there is none, and inventing one here would make the reference for the next
+        // arrival the oldest packet rather than the newest — after which a chain of
+        // stragglers walks the accepted window backwards a reorder window at a time,
+        // and the boundary between "straggler" and "restarted sender" stops meaning
+        // anything. Cold start anchors lazily at the first release instead.
+        if self.next.is_some() {
+            if let Some((seq, id)) = self.oldest() {
+                self.next = Some((seq, id));
+            }
         }
     }
 
@@ -581,6 +595,13 @@ mod tests {
     /// ahead, reorder window 16, retain at most 12 packets on resync.
     fn jb() -> JitterBuffer {
         JitterBuffer::new(200, 8, 200, 16, 12)
+    }
+
+    /// Same, with room to hold a long burst: the retention cap applies from the first
+    /// arrival now that the buffer starts priming, so a test about restart or duplicate
+    /// classification needs a cap that will not trim its fixture out from under it.
+    fn jb_holding(cap: usize) -> JitterBuffer {
+        JitterBuffer::new(200, 8, 200, 16, cap)
     }
 
     #[test]
@@ -792,7 +813,7 @@ mod tests {
     /// only evidence that can tell these two apart.
     #[test]
     fn a_restart_onto_an_occupied_slot_is_a_restart_not_a_duplicate() {
-        let mut j = jb();
+        let mut j = jb_holding(64);
         for k in 0..=20i32 {
             j.insert(k, pkt(1), 1000);
         }
@@ -992,7 +1013,7 @@ mod tests {
     /// resync: new id 0, four concealments, then old id 5.
     #[test]
     fn a_source_restart_into_the_cold_start_span_is_still_a_restart() {
-        let mut j = jb();
+        let mut j = jb_holding(64);
         for k in 5..=20i32 {
             j.insert(k, pkt(1), 1000);
         }
@@ -1039,7 +1060,7 @@ mod tests {
     /// not even count the duplicate.
     #[test]
     fn a_resent_packet_from_the_start_of_a_burst_is_not_a_source_restart() {
-        let mut j = jb();
+        let mut j = jb_holding(64);
         for k in 0..21i32 {
             j.insert(100 + k, pkt(1), 1000);
         }
@@ -1188,6 +1209,30 @@ mod tests {
         assert_eq!(j.buffered(), 2);
     }
 
+    /// Cold start primes rather than releasing on its first arrival. Occupancy only
+    /// grows by concealing, so a buffer that starts in Normal stays pinned at zero depth
+    /// for as long as input and output rates match -- it would forward the very
+    /// burstiness it exists to absorb. And while priming, the retention cap applies from
+    /// the first arrival, so an opening burst cannot exceed the latency bound either.
+    #[test]
+    fn a_cold_start_primes_and_is_bounded_by_the_retention_cap() {
+        let mut j = jb(); // retain_cap 12
+        assert_eq!(j.state(), State::Priming);
+
+        j.insert(100, pkt(1), 1000);
+        assert_eq!(
+            j.release_with_target(1010, 4),
+            Released::Silence,
+            "released on the first arrival instead of priming"
+        );
+        for k in 1..40i32 {
+            j.insert(100 + k, pkt(2), 1000 + k as u64);
+        }
+        assert_eq!(j.buffered(), 12, "the opening burst was not bounded");
+        assert_eq!(j.release_with_target(1100, 4), Released::Real(pkt(2)));
+        assert_eq!(j.state(), State::Normal);
+    }
+
     /// Horizons near half the modulus make direction ambiguous: a duplicate then
     /// reads as almost a whole modulus *ahead* and is stored a second time.
     #[test]
@@ -1260,7 +1305,7 @@ mod tests {
     /// independent of the conceal horizon.
     #[test]
     fn exceeding_the_max_depth_discards_oldest() {
-        let mut j = jb();
+        let mut j = jb_holding(200);
         for k in 0..100i32 {
             j.insert(100 + k, pkt(1), 1000);
         }

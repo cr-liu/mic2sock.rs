@@ -2,6 +2,8 @@
 
 use bytes::Bytes;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -20,6 +22,7 @@ pub struct Sink {
     /// inside a multi-megabyte kernel buffer.
     sndbuf_packets: usize,
     pkt_len: usize,
+    connected: Arc<AtomicBool>,
 }
 
 impl Sink {
@@ -29,6 +32,7 @@ impl Sink {
             listener,
             sndbuf_packets,
             pkt_len,
+            connected: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -36,11 +40,29 @@ impl Sink {
         self.listener.local_addr()
     }
 
+    /// Whether a consumer is attached right now.
+    ///
+    /// The pipeline needs this because a *discard* is indistinguishable from a write
+    /// as far as the queue is concerned: with no consumer the sink drains everything
+    /// it is given, which frees the queue, which the pipeline would read as permission
+    /// to release the next packet. It would then empty the jitter buffer into a
+    /// discard and arrive at the moment the consumer connects with nothing buffered —
+    /// the exact opposite of spec §6.5, which is to hold a rolling window so the
+    /// buffer is already primed when the consumer appears.
+    ///
+    /// Deliberately coarse. It gates whether to release at all, not *when*; the
+    /// release timing is still the socket write. A stale read costs at most one
+    /// discarded packet or one extra wait.
+    pub fn connected(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.connected)
+    }
+
     /// Accepts one consumer at a time and forwards everything `rx` yields.
     ///
     /// While no consumer is attached the stream is discarded rather than queued:
-    /// there is no release clock without a consumer, so queueing would grow
-    /// without bound.
+    /// there is no release clock without a consumer, so queueing would grow without
+    /// bound. The pipeline is told (see [`Sink::connected`]) so that it holds a
+    /// rolling window instead of feeding this discard.
     pub async fn run(self, mut rx: mpsc::Receiver<Bytes>) {
         let mut current: Option<TcpStream> = None;
         loop {
@@ -73,6 +95,7 @@ impl Sink {
                             // which closes it -- that close is what tells a
                             // displaced consumer it has been replaced.
                             current = Some(sock);
+                            self.connected.store(true, Ordering::Relaxed);
                         }
                         Err(e) => eprintln!("sink: accept failed: {}", e),
                     }
@@ -80,13 +103,49 @@ impl Sink {
                 item = rx.recv() => {
                     let Some(pkt) = item else { return };
                     if let Some(sock) = current.as_mut() {
-                        // write_all is what applies backpressure, and with a
-                        // deliberately small SO_SNDBUF it returns only once the
-                        // consumer has actually taken the data. That is the
-                        // release clock.
-                        if let Err(e) = sock.write_all(&pkt).await {
-                            eprintln!("sink: consumer write failed: {}", e);
-                            current = None;
+                        // The write is what applies backpressure, and with a
+                        // deliberately small SO_SNDBUF it returns close to when the
+                        // consumer takes the data. That is the release clock.
+                        //
+                        // It races `accept` because a consumer that connects and then
+                        // stops reading blocks this write indefinitely, and without the
+                        // race its replacement would wait behind it forever -- exactly
+                        // the case newest-wins exists to recover from. Abandoning a
+                        // half-written packet is safe *because* we are discarding that
+                        // consumer: the partial bytes die with its socket, and a
+                        // consumer that is being replaced cannot be corrupted by them.
+                        let write = sock.write_all(&pkt);
+                        tokio::select! {
+                            biased;
+                            res = write => {
+                                if let Err(e) = res {
+                                    eprintln!("sink: consumer write failed: {}", e);
+                                    current = None;
+                                    self.connected.store(false, Ordering::Relaxed);
+                                }
+                            }
+                            accepted = self.listener.accept() => {
+                                match accepted {
+                                    Ok((sock, peer)) => {
+                                        eprintln!(
+                                            "sink: {} replaces a consumer that stopped reading",
+                                            peer
+                                        );
+                                        let _ = sock.set_nodelay(true);
+                                        let want = self.pkt_len * self.sndbuf_packets;
+                                        if let Err(e) =
+                                            socket2::SockRef::from(&sock).set_send_buffer_size(want)
+                                        {
+                                            eprintln!(
+                                                "sink: could not set SO_SNDBUF to {}: {}",
+                                                want, e
+                                            );
+                                        }
+                                        current = Some(sock);
+                                    }
+                                    Err(e) => eprintln!("sink: accept failed: {}", e),
+                                }
+                            }
                         }
                     }
                     // else: no consumer, so discard.

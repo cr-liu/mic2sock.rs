@@ -35,7 +35,19 @@ fn parse_config_arg() -> Option<PathBuf> {
     match args.next() {
         None => None,
         Some(flag) if flag == "--config" => match args.next() {
-            Some(p) => Some(PathBuf::from(p)),
+            Some(p) => {
+                if let Some(extra) = args.next() {
+                    // Refused rather than ignored: an argument the operator meant to
+                    // matter, silently dropped, is the same class of confusion as a
+                    // misspelled config key.
+                    eprintln!(
+                        "shim: unexpected argument {:?} after --config <path>",
+                        extra
+                    );
+                    std::process::exit(2);
+                }
+                Some(PathBuf::from(p))
+            }
             None => {
                 eprintln!("shim: --config needs a path");
                 std::process::exit(2);

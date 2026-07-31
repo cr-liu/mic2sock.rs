@@ -149,8 +149,32 @@ async fn clean_stream_arrives_correctly_framed_and_channel_aligned() {
     let mut c0 = vec![0i16; l.spp];
     let mut cx = vec![0i16; l.spp];
 
-    for _ in 0..8 {
+    // Cold start primes: the buffer holds silence until it has the target depth, because
+    // occupancy only grows by concealing and a buffer that released its first arrival
+    // would stay at zero depth and forward the burstiness it exists to absorb. Skip that
+    // preamble -- and bound it, since an unbounded one would mean the pipeline was
+    // releasing into a discard instead of retaining a window.
+    let mut preamble = 0;
+    let buf = loop {
         let buf = read_one_packet(&mut consumer, l.packet_len()).await;
+        deblock_channel(&buf, &l, 1, &mut cx);
+        if cx.iter().any(|&s| s != 0) {
+            break buf;
+        }
+        preamble += 1;
+        assert!(
+            preamble < 40,
+            "still priming after {} packets; the buffer is not retaining a window",
+            preamble
+        );
+    };
+
+    let mut first = Some(buf);
+    for _ in 0..8 {
+        let buf = match first.take() {
+            Some(b) => b,
+            None => read_one_packet(&mut consumer, l.packet_len()).await,
+        };
 
         let h = Header::parse(&buf).expect("output packet too short to hold a header");
         if let Some(p) = prev_id {
@@ -158,20 +182,38 @@ async fn clean_stream_arrives_correctly_framed_and_channel_aligned() {
         }
         prev_id = Some(h.pkt_id);
 
-        // Channel c is channel 0 plus c*1000, by construction. This is the
-        // property that matters: reframing must not disturb inter-channel
-        // relationships, because the downstream echo-canceller depends on them.
+        // Channel c is channel 0 plus c*1000 by construction, so the difference between
+        // two channels at the same sample is c*1000 times whatever gain is in force.
+        // Checking the difference rather than the value cancels the resampler's phase,
+        // which drifts by design; estimating the gain per sample rather than asserting
+        // 1000 outright is what makes this valid during a fade as well, where every
+        // channel is scaled by one common ramp.
+        //
+        // A *common* gain is the point: it preserves inter-channel phase and relative
+        // amplitude, which is what the downstream echo canceller depends on. A
+        // per-channel difference in either would not.
         deblock_channel(&buf, &l, 0, &mut c0);
+        let mut top = vec![0i16; l.spp];
+        deblock_channel(&buf, &l, l.n_ch - 1, &mut top);
         for c in 1..l.n_ch {
             deblock_channel(&buf, &l, c, &mut cx);
             for i in 0..l.spp {
-                assert_eq!(
-                    cx[i].wrapping_sub(c0[i]),
-                    (c * 1000) as i16,
-                    "inter-channel offset broken: output packet {} channel {} sample {}",
+                let gain = (top[i] - c0[i]) as f64 / ((l.n_ch - 1) * 1000) as f64;
+                if gain < 0.01 {
+                    continue; // fully faded: all zeros carry no information
+                }
+                let want = (c as f64 * 1000.0 * gain).round() as i16;
+                let got = cx[i] - c0[i];
+                assert!(
+                    (got - want).abs() <= 2,
+                    "inter-channel offset broken: packet {} channel {} sample {}: \
+                     {} vs {} (gain {:.4})",
                     h.pkt_id,
                     c,
-                    i
+                    i,
+                    got,
+                    want,
+                    gain
                 );
             }
         }
