@@ -17,5 +17,5 @@ pub use backoff::Backoff;
 // (deblock_channel / reblock_channel), meant to be reached as
 // protocol::block::...
 pub use gap::{GapAction, GapTracker};
-pub use header::{Header, HEADER_LEN};
+pub use header::{next_pkt_id, Header, HEADER_LEN};
 pub use layout::PacketLayout;

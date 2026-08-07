@@ -8,6 +8,15 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
+/// SO_SNDBUF for the consumer's socket, in packets.
+///
+/// As load-bearing as the two-slot pipeline queue, and small for the same reason:
+/// backpressure has to appear in our code rather than inside a multi-megabyte
+/// kernel buffer, or the write stops being the release clock. The kernel may round
+/// or double the byte value. One named constant, because retuning the clock's
+/// tightness must not mean hunting bare `3`s across call sites and tests.
+pub const SNDBUF_PACKETS: usize = 3;
+
 /// Serves the consumer over localhost.
 ///
 /// The release clock is the consumer's read rate: a packet is requested from the
@@ -18,19 +27,15 @@ use tokio::sync::mpsc;
 /// rate equals its device rate; and buffer depth becomes directly observable.
 pub struct Sink {
     listener: TcpListener,
-    /// Kept small on purpose, so backpressure appears in our code rather than
-    /// inside a multi-megabyte kernel buffer.
-    sndbuf_packets: usize,
     pkt_len: usize,
     connected: Arc<AtomicBool>,
 }
 
 impl Sink {
-    pub async fn bind(addr: &str, sndbuf_packets: usize, pkt_len: usize) -> io::Result<Self> {
+    pub async fn bind(addr: &str, pkt_len: usize) -> io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
         Ok(Sink {
             listener,
-            sndbuf_packets,
             pkt_len,
             connected: Arc::new(AtomicBool::new(false)),
         })
@@ -57,6 +62,29 @@ impl Sink {
         Arc::clone(&self.connected)
     }
 
+    /// Configures and installs an accepted consumer.
+    ///
+    /// The one place `current` is ever set, paired with `drop_consumer` below, so
+    /// the invariant `connected == current.is_some()` cannot be broken by a call
+    /// site updating one without the other — it once held at only three of the
+    /// four mutation sites, correct by coincidence at the fourth.
+    fn install(&self, current: &mut Option<TcpStream>, sock: TcpStream) {
+        let _ = sock.set_nodelay(true);
+        let want = self.pkt_len * SNDBUF_PACKETS;
+        if let Err(e) = socket2::SockRef::from(&sock).set_send_buffer_size(want) {
+            eprintln!("sink: could not set SO_SNDBUF to {}: {}", want, e);
+        }
+        // Reassigning `current` drops any previous stream, which closes it — that
+        // close is what tells a displaced consumer it has been replaced.
+        *current = Some(sock);
+        self.connected.store(true, Ordering::Relaxed);
+    }
+
+    fn drop_consumer(&self, current: &mut Option<TcpStream>) {
+        *current = None;
+        self.connected.store(false, Ordering::Relaxed);
+    }
+
     /// Accepts one consumer at a time and forwards everything `rx` yields.
     ///
     /// While no consumer is attached the stream is discarded rather than queued:
@@ -79,23 +107,12 @@ impl Sink {
                 accepted = self.listener.accept() => {
                     match accepted {
                         Ok((sock, peer)) => {
-                            let _ = sock.set_nodelay(true);
-                            let want = self.pkt_len * self.sndbuf_packets;
-                            if let Err(e) =
-                                socket2::SockRef::from(&sock).set_send_buffer_size(want)
-                            {
-                                eprintln!("sink: could not set SO_SNDBUF to {}: {}", want, e);
-                            }
                             if current.is_some() {
                                 eprintln!("sink: {} replaces the previous consumer", peer);
                             } else {
                                 eprintln!("sink: consumer connected from {}", peer);
                             }
-                            // Reassigning `current` drops the old stream here,
-                            // which closes it -- that close is what tells a
-                            // displaced consumer it has been replaced.
-                            current = Some(sock);
-                            self.connected.store(true, Ordering::Relaxed);
+                            self.install(&mut current, sock);
                         }
                         Err(e) => eprintln!("sink: accept failed: {}", e),
                     }
@@ -120,8 +137,7 @@ impl Sink {
                             res = write => {
                                 if let Err(e) = res {
                                     eprintln!("sink: consumer write failed: {}", e);
-                                    current = None;
-                                    self.connected.store(false, Ordering::Relaxed);
+                                    self.drop_consumer(&mut current);
                                 }
                             }
                             accepted = self.listener.accept() => {
@@ -131,17 +147,7 @@ impl Sink {
                                             "sink: {} replaces a consumer that stopped reading",
                                             peer
                                         );
-                                        let _ = sock.set_nodelay(true);
-                                        let want = self.pkt_len * self.sndbuf_packets;
-                                        if let Err(e) =
-                                            socket2::SockRef::from(&sock).set_send_buffer_size(want)
-                                        {
-                                            eprintln!(
-                                                "sink: could not set SO_SNDBUF to {}: {}",
-                                                want, e
-                                            );
-                                        }
-                                        current = Some(sock);
+                                        self.install(&mut current, sock);
                                     }
                                     Err(e) => eprintln!("sink: accept failed: {}", e),
                                 }
@@ -163,7 +169,7 @@ mod tests {
 
     #[tokio::test]
     async fn forwards_packets_to_a_connected_consumer() {
-        let sink = Sink::bind("127.0.0.1:0", 3, 4).await.unwrap();
+        let sink = Sink::bind("127.0.0.1:0", 4).await.unwrap();
         let addr = sink.local_addr().unwrap();
         let (tx, rx) = mpsc::channel::<Bytes>(8);
         tokio::spawn(sink.run(rx));
@@ -186,7 +192,7 @@ mod tests {
     /// own stale connection.
     #[tokio::test]
     async fn a_new_consumer_replaces_the_old_one() {
-        let sink = Sink::bind("127.0.0.1:0", 3, 4).await.unwrap();
+        let sink = Sink::bind("127.0.0.1:0", 4).await.unwrap();
         let addr = sink.local_addr().unwrap();
         let (tx, rx) = mpsc::channel::<Bytes>(8);
         tokio::spawn(sink.run(rx));
@@ -230,7 +236,7 @@ mod tests {
     /// With no consumer attached, sends must not block the pipeline forever.
     #[tokio::test]
     async fn discards_while_no_consumer_is_attached() {
-        let sink = Sink::bind("127.0.0.1:0", 3, 4).await.unwrap();
+        let sink = Sink::bind("127.0.0.1:0", 4).await.unwrap();
         let (tx, rx) = mpsc::channel::<Bytes>(4);
         tokio::spawn(sink.run(rx));
         for n in 0u8..20 {

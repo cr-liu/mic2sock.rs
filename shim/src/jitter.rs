@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use protocol::next_pkt_id;
 use std::collections::BTreeMap;
 
 /// What the pipeline should emit next.
@@ -101,7 +102,14 @@ pub struct JitterBuffer {
     /// event justifying a reset of the depth statistic.
     pub generation_resets: u64,
     pub duplicate_discards: u64,
+    /// The buffer's own view, observed by its tests. NOT the JSONL field of the
+    /// same name: the pipeline defines that one itself (a `Repeat` release), and
+    /// the two legitimately differ — a conceal with no previous packet to repeat
+    /// releases `Silence`, which is counted here and not there.
     pub conceal_events: u64,
+    /// Likewise the buffer's own view (entries into `State::Outage`); the JSONL
+    /// field of the same name counts the depth estimator's per-arrival delay
+    /// classification, a different event.
     pub outage_events: u64,
     pub resync_events: u64,
 }
@@ -362,10 +370,9 @@ impl JitterBuffer {
     /// where the floor would refuse them.
     fn resync_to(&mut self, pkt_id: i32, payload: Bytes, now_ms: u64) {
         self.store.clear();
-        self.seq_hint += self.reorder_window as u64 + 1;
-        let seq = self.seq_hint;
-        self.store.insert(seq, (pkt_id, payload));
+        let seq = self.seq_hint + self.reorder_window as u64 + 1;
         self.seq_hint = seq + 1;
+        self.store.insert(seq, (pkt_id, payload));
         self.next = Some((seq, pkt_id));
         self.state = State::Priming;
         self.resync_events += 1;
@@ -418,8 +425,14 @@ impl JitterBuffer {
         }
     }
 
-    /// Releases the next item, with no priming gate.
-    pub fn release(&mut self, now_ms: u64) -> Released {
+    /// Test convenience: release with no priming gate.
+    ///
+    /// `#[cfg(test)]` on purpose. Target 0 turns off the cold-start prime, and a
+    /// public method with the shorter, more inviting name must not be the one
+    /// that silently drops that invariant — production always goes through
+    /// `release_with_target`.
+    #[cfg(test)]
+    fn release(&mut self, now_ms: u64) -> Released {
         self.release_with_target(now_ms, 0)
     }
 
@@ -470,16 +483,16 @@ impl JitterBuffer {
             State::Priming => {
                 if self.store.len() >= target_packets {
                     self.state = State::Normal;
-                    self.release_normal(now_ms)
+                    self.release_normal()
                 } else {
                     Released::Silence
                 }
             }
-            State::Normal => self.release_normal(now_ms),
+            State::Normal => self.release_normal(),
         }
     }
 
-    fn release_normal(&mut self, _now_ms: u64) -> Released {
+    fn release_normal(&mut self) -> Released {
         // Anchor lazily, at the oldest stored packet, so an out-of-order opening
         // pair is reordered rather than half discarded.
         if self.next.is_none() {
@@ -488,10 +501,10 @@ impl JitterBuffer {
                 None => return Released::Nothing,
             }
         }
-        let (next_seq, _) = self.next.expect("anchored above");
+        let (next_seq, next_id) = self.next.expect("anchored above");
 
         if let Some((id, payload)) = self.store.remove(&next_seq) {
-            self.next = Some((next_seq + 1, wrapping_next_id(id)));
+            self.next = Some((next_seq + 1, next_pkt_id(id)));
             self.abandon_upto(next_seq + 1);
             self.last_real = Some(payload.clone());
             return Released::Real(payload);
@@ -510,8 +523,7 @@ impl JitterBuffer {
 
         if gap as usize <= self.max_conceal_packets {
             // Conceal exactly one packet, in place, and advance by one.
-            let (_, next_id) = self.next.expect("anchored");
-            self.next = Some((next_seq + 1, wrapping_next_id(next_id)));
+            self.next = Some((next_seq + 1, next_pkt_id(next_id)));
             // The consumer has been given this slot, even though the audio was
             // synthetic, so a straggler for it must not reopen it later.
             self.abandon_upto(next_seq + 1);
@@ -526,7 +538,7 @@ impl JitterBuffer {
         self.resync_events += 1;
         self.next = Some((oldest_seq, oldest_id));
         self.abandon_upto(oldest_seq);
-        self.release_normal(_now_ms)
+        self.release_normal()
     }
 
     /// Safety valve: discards oldest until at most `max_packets` remain. Returns
@@ -538,6 +550,21 @@ impl JitterBuffer {
     /// the mic channels by the width of that gap with nothing counted -- the very
     /// failure this module exists to prevent.
     pub fn enforce_max_depth(&mut self, max_packets: usize) -> usize {
+        self.trim_oldest(max_packets, true)
+    }
+
+    /// Spec §6.5's rolling window: while no consumer is attached, keep only the
+    /// most recent `max_packets` so the buffer is primed the moment one appears.
+    ///
+    /// The same discipline as the safety valve — discard oldest, re-anchor, raise
+    /// the floor — but **not counted as a resync**: with no consumer there is no
+    /// timeline to break, and charging ~100 events/s of normal idling to an alarm
+    /// counter the README says should stay near zero made that counter unreadable.
+    pub fn retain_window(&mut self, max_packets: usize) -> usize {
+        self.trim_oldest(max_packets, false)
+    }
+
+    fn trim_oldest(&mut self, max_packets: usize, break_timeline: bool) -> usize {
         let mut dropped = 0;
         let mut last_dropped = None;
         while self.store.len() > max_packets {
@@ -555,7 +582,7 @@ impl JitterBuffer {
             // covered real loss.
             self.next = match self.oldest() {
                 Some(pos) => Some(pos),
-                None => last_dropped.map(|(seq, id)| (seq + 1, wrapping_next_id(id))),
+                None => last_dropped.map(|(seq, id)| (seq + 1, next_pkt_id(id))),
             };
             // Deliberately discarded audio: the consumer will never get those
             // slots, so a straggler for one of them must not reopen it — that
@@ -565,21 +592,14 @@ impl JitterBuffer {
                 self.abandon_upto(seq);
             }
             // Discarding buffered audio breaks the timeline deliberately, so it
-            // is counted like any other resync rather than being silent.
-            self.resync_events += 1;
+            // is counted like any other resync rather than being silent — except
+            // for the idle rolling window, where nothing is being released and
+            // there is no timeline to break.
+            if break_timeline {
+                self.resync_events += 1;
+            }
         }
         dropped
-    }
-}
-
-/// The sender's successor for a wire id: `i32::MAX` never appears, so `MAX - 1`
-/// is followed by `0`.
-fn wrapping_next_id(id: i32) -> i32 {
-    let n = id.wrapping_add(1);
-    if n == i32::MAX {
-        0
-    } else {
-        n
     }
 }
 
@@ -1317,6 +1337,30 @@ mod tests {
         let dropped = j.enforce_max_depth(20);
         assert_eq!(dropped, 80);
         assert_eq!(j.buffered(), 20);
+    }
+
+    /// The idle rolling window trims with the same discipline as the safety valve
+    /// but must not be counted as a resync: nothing is being released, so there is
+    /// no timeline to break — and charging normal idling to an alarm counter the
+    /// README says should stay near zero would make that counter unreadable.
+    #[test]
+    fn idle_retention_trims_without_counting_a_resync() {
+        let mut j = jb_holding(64);
+        for k in 0..20i32 {
+            j.insert(100 + k, pkt(1), 1000 + k as u64);
+        }
+        let resyncs = j.resync_events;
+
+        assert_eq!(j.retain_window(4), 16);
+        assert_eq!(j.buffered(), 4);
+        assert_eq!(
+            j.resync_events, resyncs,
+            "idle retention counted as a resync"
+        );
+
+        // The floor discipline is unchanged: a straggler for a trimmed slot is late.
+        j.insert(100, pkt(9), 2000);
+        assert_eq!(j.late_discards, 1, "a trimmed slot was reopened");
     }
 
     /// The safety valve must not re-anchor when it dropped nothing. Jumping the

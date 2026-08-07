@@ -14,8 +14,8 @@
 //! 1.39) says the same thing without the false MSRV claim. Add the trait back once
 //! a second transport actually exists and its shared shape is known -- not before.
 
-use bytes::Bytes;
-use protocol::{Backoff, Header};
+use bytes::{Bytes, BytesMut};
+use protocol::{next_pkt_id, Backoff, Header};
 use std::io;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -64,7 +64,10 @@ const GEOMETRY_CHECK_PACKETS: usize = 8;
 /// socket.
 pub struct Framer {
     pkt_len: usize,
-    buf: Vec<u8>,
+    /// `BytesMut`, so completing a packet is an O(1) `split_to` handing off the
+    /// front rather than a `split_off`/`mem::replace` dance — which also threw the
+    /// buffer's capacity away with every packet and reallocated on the next read.
+    buf: BytesMut,
 }
 
 impl Framer {
@@ -72,7 +75,7 @@ impl Framer {
         assert!(pkt_len > 0, "pkt_len must be > 0");
         Framer {
             pkt_len,
-            buf: Vec::with_capacity(pkt_len * 2),
+            buf: BytesMut::with_capacity(pkt_len * 2),
         }
     }
 
@@ -81,8 +84,7 @@ impl Framer {
         self.buf.extend_from_slice(data);
         let mut out = Vec::new();
         while self.buf.len() >= self.pkt_len {
-            let rest = self.buf.split_off(self.pkt_len);
-            out.push(Bytes::from(std::mem::replace(&mut self.buf, rest)));
+            out.push(self.buf.split_to(self.pkt_len).freeze());
         }
         out
     }
@@ -160,11 +162,10 @@ impl GeometryCheck {
             ));
         }
         if let Some(prev) = self.last_pkt_id {
-            // The sender's own wrap rule: i32::MAX never appears, so the successor
-            // of i32::MAX - 1 is 0. Only the *step* is checkable, not the absolute
-            // value -- the shim joins an already-running stream, so there is no
-            // baseline to compare the first id against.
-            let expected = if prev == i32::MAX - 1 { 0 } else { prev + 1 };
+            // Only the *step* is checkable, not the absolute value -- the shim
+            // joins an already-running stream, so there is no baseline to compare
+            // the first id against.
+            let expected = next_pkt_id(prev);
             if h.pkt_id != expected {
                 return Err(format!(
                     "source geometry mismatch: pkt_id jumped from {} to {} (expected {}); \
@@ -269,18 +270,17 @@ impl TcpSource {
                 if let Err(msg) = geometry.check(&p) {
                     return Err(PumpError::Fatal(msg));
                 }
-                if geometry.passed() {
-                    if let Some(prev) = held.take() {
-                        if tx.send(SourceEvent::Packet(prev)).await.is_err() {
-                            return Ok(()); // pipeline shut down
-                        }
-                    }
-                    if tx.send(SourceEvent::Packet(p)).await.is_err() {
-                        return Ok(());
-                    }
-                } else if let Some(confirmed) = held.replace(p) {
-                    if tx.send(SourceEvent::Packet(confirmed)).await.is_err() {
-                        return Ok(());
+                // Release order: the held frame first, then this one — but this one
+                // only once the window has passed; while validating, it waits for
+                // its successor to confirm it.
+                let (first, second) = if geometry.passed() {
+                    (held.take(), Some(p))
+                } else {
+                    (held.replace(p), None)
+                };
+                for pkt in first.into_iter().chain(second) {
+                    if tx.send(SourceEvent::Packet(pkt)).await.is_err() {
+                        return Ok(()); // pipeline shut down
                     }
                 }
             }

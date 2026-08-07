@@ -130,19 +130,27 @@ async fn read_one_packet(consumer: &mut TcpStream, want: usize) -> Vec<u8> {
     buf
 }
 
-#[tokio::test]
-async fn clean_stream_arrives_correctly_framed_and_channel_aligned() {
-    let l = layout();
+/// Boots the whole rig — fake Pi, sink bound on port 0, pipeline — and returns the
+/// port the fake consumer should read from. One home for the eight lines every test
+/// repeated, and the one place the bind-port-0 discipline lives.
+async fn start_rig(count: i32, skip: Vec<i32>, pkt_len: usize) -> u16 {
     let pi_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let pi_port = pi_listener.local_addr().unwrap().port();
-    tokio::spawn(fake_pi(pi_listener, 60, vec![]));
+    tokio::spawn(fake_pi(pi_listener, count, skip));
 
-    let sink = Sink::bind("127.0.0.1:0", 3, l.packet_len()).await.unwrap();
+    let sink = Sink::bind("127.0.0.1:0", pkt_len).await.unwrap();
     let sink_port = sink.local_addr().unwrap().port();
     tokio::spawn(pipeline::run_with_sink(
         test_config(pi_port, sink_port),
         sink,
     ));
+    sink_port
+}
+
+#[tokio::test]
+async fn clean_stream_arrives_correctly_framed_and_channel_aligned() {
+    let l = layout();
+    let sink_port = start_rig(60, vec![], l.packet_len()).await;
 
     let mut consumer = connect_retrying(sink_port).await;
     let mut prev_id: Option<i32> = None;
@@ -152,22 +160,22 @@ async fn clean_stream_arrives_correctly_framed_and_channel_aligned() {
     // Cold start primes: the buffer holds silence until it has the target depth, because
     // occupancy only grows by concealing and a buffer that released its first arrival
     // would stay at zero depth and forward the burstiness it exists to absorb. Skip that
-    // preamble -- and bound it, since an unbounded one would mean the pipeline was
-    // releasing into a discard instead of retaining a window.
-    let mut preamble = 0;
-    let buf = loop {
-        let buf = read_one_packet(&mut consumer, l.packet_len()).await;
-        deblock_channel(&buf, &l, 1, &mut cx);
-        if cx.iter().any(|&s| s != 0) {
-            break buf;
+    // preamble. Its bound is a *duration*, not a packet count: this consumer reads flat
+    // out, and a flat-out reader is the clock, so however many silence packets fit into
+    // the few milliseconds it takes the source to deliver the target depth is however
+    // many there are. A count bound here failed one run in ten on scheduling luck.
+    let deadline = Duration::from_secs(5);
+    let buf = timeout(deadline, async {
+        loop {
+            let buf = read_one_packet(&mut consumer, l.packet_len()).await;
+            deblock_channel(&buf, &l, 1, &mut cx);
+            if cx.iter().any(|&s| s != 0) {
+                break buf;
+            }
         }
-        preamble += 1;
-        assert!(
-            preamble < 40,
-            "still priming after {} packets; the buffer is not retaining a window",
-            preamble
-        );
-    };
+    })
+    .await
+    .expect("still priming after 5 s; the buffer is not retaining a window");
 
     let mut first = Some(buf);
     for _ in 0..8 {
@@ -230,20 +238,11 @@ async fn clean_stream_arrives_correctly_framed_and_channel_aligned() {
 #[tokio::test]
 async fn a_source_gap_still_yields_a_gapless_output_id_sequence() {
     let l = layout();
-    let pi_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let pi_port = pi_listener.local_addr().unwrap().port();
     // All three skipped ids are well past the first 8 packets that
     // `TcpSource`'s geometry cross-check inspects (see `fake_pi`'s doc
     // comment); a gap inside that window would exit the process instead of
     // failing this test.
-    tokio::spawn(fake_pi(pi_listener, 80, vec![20, 21, 40]));
-
-    let sink = Sink::bind("127.0.0.1:0", 3, l.packet_len()).await.unwrap();
-    let sink_port = sink.local_addr().unwrap().port();
-    tokio::spawn(pipeline::run_with_sink(
-        test_config(pi_port, sink_port),
-        sink,
-    ));
+    let sink_port = start_rig(80, vec![20, 21, 40], l.packet_len()).await;
 
     let mut consumer = connect_retrying(sink_port).await;
     let mut ids = Vec::new();
@@ -274,16 +273,7 @@ async fn a_source_gap_still_yields_a_gapless_output_id_sequence() {
 async fn every_output_packet_has_exactly_the_expected_length() {
     let l = layout();
     let want = l.packet_len();
-    let pi_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let pi_port = pi_listener.local_addr().unwrap().port();
-    tokio::spawn(fake_pi(pi_listener, 60, vec![]));
-
-    let sink = Sink::bind("127.0.0.1:0", 3, want).await.unwrap();
-    let sink_port = sink.local_addr().unwrap().port();
-    tokio::spawn(pipeline::run_with_sink(
-        test_config(pi_port, sink_port),
-        sink,
-    ));
+    let sink_port = start_rig(60, vec![], want).await;
 
     let mut consumer = connect_retrying(sink_port).await;
     const N: usize = 30;

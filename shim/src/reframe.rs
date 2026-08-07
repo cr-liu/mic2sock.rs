@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use clocksync::Resampler;
 use protocol::block::{deblock_channel, reblock_channel};
-use protocol::{Header, PacketLayout};
+use protocol::{next_pkt_id, Header, PacketLayout};
 
 /// Converts between the packet domain and the sample domain, with resampling in
 /// between.
@@ -47,8 +47,11 @@ pub struct Reframer {
     scratch: Vec<i16>,
     device_id: u16,
     out_pkt_id: i32,
-    /// Header of the first input packet contributing to the packet being built.
-    pending_header: Option<Header>,
+    /// Timestamp of the first input packet contributing to the packet being built —
+    /// only the milliseconds, because that is all `drain` ever read from the header
+    /// it used to keep, and a whole retained `Header` implied interactions with the
+    /// timeline that never existed.
+    pending_anchor_ms: Option<u64>,
     /// Timestamp for the next output packet, in milliseconds since the epoch, used
     /// when no input header is available to anchor it. See `drain`.
     next_out_ts_ms: u64,
@@ -80,22 +83,16 @@ impl Reframer {
             out_layout,
             resampler: Resampler::new(n_ch),
             acc: (0..n_ch).map(|_| Vec::new()).collect(),
-            scratch: vec![0i16; 0],
+            scratch: vec![0i16; in_layout.spp],
             device_id,
             out_pkt_id: 0,
-            pending_header: None,
+            pending_anchor_ms: None,
             next_out_ts_ms: 0,
             out_packet_ms: (out_layout.spp as u64 * 1000 / sample_rate as u64).max(1),
             gain: 1.0,
             gain_target: 1.0,
             gain_step: 1.0 / fade_samples as f64,
         }
-    }
-
-    /// Milliseconds since the epoch named by a header. `ms` is signed on the wire,
-    /// so this is computed in `i64` before being brought back.
-    fn header_ms(h: &Header) -> u64 {
-        (h.secs as i64 * 1000 + h.ms as i64).max(0) as u64
     }
 
     /// Feeds one input packet's audio, without letting it anchor the output timeline.
@@ -119,17 +116,12 @@ impl Reframer {
             // and may key on this field, so the shim has to be transparent in it.
             // Kept across silence too, so an outage does not renumber the device.
             self.device_id = h.device_id;
-        }
-        if self.pending_header.is_none() {
-            self.pending_header = Header::parse(packet);
+            self.pending_anchor_ms.get_or_insert(h.epoch_ms());
         }
         self.push_samples(packet);
     }
 
     fn push_samples(&mut self, packet: &[u8]) {
-        if self.scratch.len() != self.in_layout.spp {
-            self.scratch = vec![0i16; self.in_layout.spp];
-        }
         for c in 0..self.in_layout.n_ch {
             deblock_channel(packet, &self.in_layout, c, &mut self.scratch);
             self.resampler.push(c, &self.scratch);
@@ -143,7 +135,7 @@ impl Reframer {
     /// than stay monotonic.
     pub fn reset_timeline(&mut self) {
         self.next_out_ts_ms = 0;
-        self.pending_header = None;
+        self.pending_anchor_ms = None;
     }
 
     /// Feeds one input packet's worth of silence, and aims the fade at zero.
@@ -186,11 +178,10 @@ impl Reframer {
     /// to `out`.
     pub fn drain(&mut self, step: f64, out: &mut Vec<Bytes>) {
         let want = self.out_layout.spp * 2;
-        let mut pulled: Vec<Vec<i16>> = (0..self.in_layout.n_ch).map(|_| Vec::new()).collect();
-        self.resampler.pull(step, want, &mut pulled);
-        for (c, s) in pulled.iter().enumerate() {
-            self.acc[c].extend_from_slice(s);
-        }
+        // Straight into the accumulators: `pull` appends per channel, and `acc` is
+        // exactly where the samples were going. A per-call staging Vec here cost
+        // ~12,000 allocations and a megabyte of copying per second, all throwaway.
+        self.resampler.pull(step, want, &mut self.acc);
 
         while self.acc.iter().all(|a| a.len() >= self.out_layout.spp) {
             let mut buf = vec![0u8; self.out_layout.packet_len()];
@@ -207,8 +198,7 @@ impl Reframer {
             // back to a fresher-but-older input stamp made the sequence go backwards by
             // as much as it had run ahead. A genuine clock change comes with a proven
             // sender restart, and `reset_timeline` is how that one is expressed.
-            let anchor = self.pending_header.take().map(|h| Self::header_ms(&h));
-            let ts_ms = match anchor {
+            let ts_ms = match self.pending_anchor_ms.take() {
                 Some(ts) if ts >= self.next_out_ts_ms => ts,
                 _ => self.next_out_ts_ms,
             };
@@ -227,32 +217,32 @@ impl Reframer {
                 self.ramp(self.out_layout.spp)
             };
             for c in 0..self.out_layout.n_ch {
-                let taken: Vec<i16> = self.acc[c].drain(..self.out_layout.spp).collect();
-                let faded: Vec<i16> = if ramp.is_empty() {
-                    taken
+                // The frame is already contiguous at the front of the accumulator, so
+                // in steady state (no fade running) it is reblocked in place — the
+                // per-channel staging Vec this replaces was 1,700 allocations/s of
+                // pure copying. Only a running fade materialises a scaled copy.
+                if ramp.is_empty() {
+                    reblock_channel(
+                        &mut buf,
+                        &self.out_layout,
+                        c,
+                        &self.acc[c][..self.out_layout.spp],
+                    );
                 } else {
-                    taken
+                    let faded: Vec<i16> = self.acc[c][..self.out_layout.spp]
                         .iter()
                         .zip(&ramp)
                         .map(|(&s, &g)| (s as f64 * g).round() as i16)
-                        .collect()
-                };
-                reblock_channel(&mut buf, &self.out_layout, c, &faded);
+                        .collect();
+                    reblock_channel(&mut buf, &self.out_layout, c, &faded);
+                }
+                self.acc[c].drain(..self.out_layout.spp);
             }
             self.gain = gain_after;
 
-            self.out_pkt_id = if self.out_pkt_id == i32::MAX - 1 {
-                0
-            } else {
-                self.out_pkt_id + 1
-            };
+            self.out_pkt_id = next_pkt_id(self.out_pkt_id);
             out.push(Bytes::from(buf));
         }
-    }
-
-    /// Output samples per channel currently accumulated but not yet framed.
-    pub fn accumulated(&self) -> usize {
-        self.acc.first().map_or(0, Vec::len)
     }
 }
 
@@ -265,6 +255,20 @@ mod tests {
             PacketLayout::new(2, spp_in, 12),
             PacketLayout::new(2, spp_out, 12),
         )
+    }
+
+    /// A zero-payload packet stamped at `secs = 100` plus `ms` — the header-only
+    /// fixture the timeline tests share.
+    fn stamped(l: &PacketLayout, ms: i16, pkt_id: i32) -> Bytes {
+        let mut buf = vec![0u8; l.packet_len()];
+        Header {
+            device_id: 5,
+            secs: 100,
+            ms,
+            pkt_id,
+        }
+        .write_to(&mut buf);
+        Bytes::from(buf)
     }
 
     /// Builds an input packet whose channel `c` carries `base + c*1000 + i`.
@@ -418,15 +422,7 @@ mod tests {
 
         // Input packets 10 ms apart, as the sender actually stamps them.
         for k in 0..6i32 {
-            let mut buf = vec![0u8; li.packet_len()];
-            Header {
-                device_id: 5,
-                secs: 100,
-                ms: (k * 10) as i16,
-                pkt_id: k,
-            }
-            .write_to(&mut buf);
-            r.push_packet(&Bytes::from(buf));
+            r.push_packet(&stamped(&li, (k * 10) as i16, k));
             r.drain(1.0, &mut out);
         }
         let real = out.len();
@@ -470,20 +466,8 @@ mod tests {
         let (li, lo) = layouts(160, 160);
         let mut r = Reframer::new(li, lo, 5, 16000, 20);
         let mut out = Vec::new();
-        let stamped = |ms: i16, id: i32| {
-            let mut buf = vec![0u8; li.packet_len()];
-            Header {
-                device_id: 5,
-                secs: 100,
-                ms,
-                pkt_id: id,
-            }
-            .write_to(&mut buf);
-            Bytes::from(buf)
-        };
-
         for k in 0..4i32 {
-            r.push_packet(&stamped((k * 10) as i16, k));
+            r.push_packet(&stamped(&li, (k * 10) as i16, k));
             r.drain(1.0, &mut out);
         }
         // Run the timeline a long way ahead on concealment alone.
@@ -495,7 +479,7 @@ mod tests {
         let ahead_ms = ahead.secs as u64 * 1000 + ahead.ms as u64;
 
         // Now a real packet whose own timestamp is far behind where output has reached.
-        r.push_packet(&stamped(40, 4));
+        r.push_packet(&stamped(&li, 40, 4));
         r.drain(1.0, &mut out);
         let after = Header::parse(out.last().unwrap()).unwrap();
         let after_ms = after.secs as u64 * 1000 + after.ms as u64;
@@ -519,15 +503,7 @@ mod tests {
 
         let mut inputs: Vec<Bytes> = Vec::new();
         for k in 0..6i32 {
-            let mut buf = vec![0u8; li.packet_len()];
-            Header {
-                device_id: 5,
-                secs: 100,
-                ms: (k * 10) as i16,
-                pkt_id: k,
-            }
-            .write_to(&mut buf);
-            let buf = Bytes::from(buf);
+            let buf = stamped(&li, (k * 10) as i16, k);
             inputs.push(buf.clone());
             r.push_packet(&buf);
             r.drain(1.0, &mut out);

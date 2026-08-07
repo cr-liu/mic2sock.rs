@@ -51,15 +51,17 @@ const REORDER_WINDOW: usize = 16;
 /// seconds ahead of the consumer, and the pacing this whole design rests on would be
 /// the loop's own speed rather than the consumer's read rate.
 const SINK_QUEUE_PACKETS: usize = 2;
-/// Depth of the channel from the source. Larger, because this side must absorb a
-/// burst: after a stall the Pi delivers its backlog as fast as the link allows, and
-/// dropping it here would defeat the catchup machinery downstream.
-const SOURCE_QUEUE_PACKETS: usize = 512;
+/// Floor on the source channel's depth, in packets. The actual depth is derived
+/// from the config (see `run_with_sink`): this side must absorb a post-stall burst
+/// — the Pi delivers its backlog as fast as the link allows — so it is sized by the
+/// same catchup-plus-valve budget the jitter buffer retains, not by a constant that
+/// silently stops matching its own rationale the day `catchup_max_ms` is raised.
+const SOURCE_QUEUE_MIN_PACKETS: usize = 512;
 
 /// Exit code used when the source proves the configured geometry cannot be right.
-pub const EXIT_GEOMETRY: i32 = 4;
+const EXIT_GEOMETRY: i32 = 4;
 /// Exit code used when the sink port cannot be bound.
-pub const EXIT_BIND: i32 = 3;
+const EXIT_BIND: i32 = 3;
 
 /// The binary's entry point: binds the sink port from the config, and exits the
 /// process if it cannot.
@@ -67,7 +69,6 @@ pub async fn run(cfg: Config) {
     let out_layout = cfg.layout();
     let sink = match Sink::bind(
         &format!("127.0.0.1:{}", cfg.sink_port),
-        3,
         out_layout.packet_len(),
     )
     .await
@@ -81,22 +82,22 @@ pub async fn run(cfg: Config) {
     run_with_sink(cfg, sink).await
 }
 
-/// Handles one source event.
+/// Handles one source event; returns whether it proved a new sender generation, so
+/// the caller can reset the reframer's output timeline.
 ///
-/// A free function rather than inline, because the generation reset has to be applied
-/// *within* the event that proved it: `jb.insert` is what detects an id reset, and
-/// deferring the reset until the whole ready batch had been drained meant a hundred
-/// packets of a restarted sender were first classified against the old clock offset —
-/// and then thrown away by the reset that followed.
+/// The generation reset is applied *within* the event that proved it: `jb.insert` is
+/// what detects an id reset, and deferring the reset until the whole ready batch had
+/// been drained meant a hundred packets of a restarted sender were first classified
+/// against the old clock offset — and then thrown away by the reset that followed.
+/// `generation_resets` is only ever incremented inside `jb.insert`, so a snapshot
+/// around the call sees every transition; no cross-iteration mirror is needed.
 fn on_event(
     ev: SourceEvent,
     t: u64,
     jb: &mut JitterBuffer,
     est: &mut DepthEstimator,
     m: &mut Metrics,
-    generation_resets_seen: &mut u64,
-    timeline_reset_due: &mut bool,
-) {
+) -> bool {
     match ev {
         SourceEvent::Connected => {
             // Every connect, including the first. This is the only evidence that a
@@ -104,28 +105,31 @@ fn on_event(
             // already emitted, and it has to arrive in order with the packets around it
             // — hence travelling through the same channel.
             jb.on_source_reconnect();
+            false
         }
         SourceEvent::Packet(pkt) => {
-            if let Some(h) = Header::parse(&pkt) {
-                let header_ms = h.secs as u64 * 1000 + h.ms.max(0) as u64;
-                jb.insert(h.pkt_id, pkt, t);
-                // A *proven* id reset — not a mere reconnect — means a new sender
-                // process and so possibly a new clock offset, which is the only thing
-                // that justifies discarding the delay statistic. An ordinary reconnect
-                // must not: the first packet after a stall is the most delayed one, and
-                // with no reference left to measure it against it would become its own
-                // baseline. Checked before observing, so this packet is the first
-                // sample of the new generation rather than the last of the old.
-                if jb.generation_resets != *generation_resets_seen {
-                    *generation_resets_seen = jb.generation_resets;
-                    est.on_generation_reset();
-                    *timeline_reset_due = true;
-                }
-                match est.observe(t, header_ms, 0) {
-                    Arrival::Jitter { above_min_ms } => m.record_delay(above_min_ms),
-                    Arrival::Outage { .. } => m.outage_events += 1,
-                }
+            let Some(h) = Header::parse(&pkt) else {
+                return false;
+            };
+            let header_ms = h.epoch_ms();
+            let generations_before = jb.generation_resets;
+            jb.insert(h.pkt_id, pkt, t);
+            // A *proven* id reset — not a mere reconnect — means a new sender process
+            // and so possibly a new clock offset, which is the only thing that
+            // justifies discarding the delay statistic. An ordinary reconnect must
+            // not: the first packet after a stall is the most delayed one, and with
+            // no reference left to measure it against it would become its own
+            // baseline. Checked before observing, so this packet is the first sample
+            // of the new generation rather than the last of the old.
+            let reset = jb.generation_resets != generations_before;
+            if reset {
+                est.on_generation_reset();
             }
+            match est.observe(t, header_ms) {
+                Arrival::Jitter { above_min_ms } => m.record_delay(above_min_ms),
+                Arrival::Outage { .. } => m.outage_events += 1,
+            }
+            reset
         }
     }
 }
@@ -144,7 +148,9 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
     let in_layout = cfg.layout();
     let out_layout = cfg.layout();
 
-    let (src_tx, mut src_rx) = mpsc::channel::<SourceEvent>(SOURCE_QUEUE_PACKETS);
+    let source_queue =
+        (cfg.catchup_max_packets() + cfg.max_depth_packets()).max(SOURCE_QUEUE_MIN_PACKETS);
+    let (src_tx, mut src_rx) = mpsc::channel::<SourceEvent>(source_queue);
     let (sink_tx, sink_rx) = mpsc::channel::<Bytes>(SINK_QUEUE_PACKETS);
 
     let src = TcpSource::new(
@@ -181,9 +187,9 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
     let max_depth_packets = cfg.max_depth_packets();
 
     let start = Instant::now();
+    let now_ms = || start.elapsed().as_millis() as u64;
     let mut last_ctl_ms = 0u64;
     let mut pending: Vec<Bytes> = Vec::new();
-    let mut generation_resets_seen = 0u64;
     let mut timeline_reset_due = false;
 
     loop {
@@ -195,19 +201,10 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
         // current target instead (spec §6.5) and wait for the next arrival. Waiting on
         // the channel rather than polling is also what keeps this off a timer.
         if !connected.load(Ordering::Relaxed) {
-            jb.enforce_max_depth(target_packets.max(1));
+            jb.retain_window(target_packets.max(1));
             match src_rx.recv().await {
                 Some(ev) => {
-                    let t = start.elapsed().as_millis() as u64;
-                    on_event(
-                        ev,
-                        t,
-                        &mut jb,
-                        &mut est,
-                        &mut m,
-                        &mut generation_resets_seen,
-                        &mut timeline_reset_due,
-                    );
+                    timeline_reset_due |= on_event(ev, now_ms(), &mut jb, &mut est, &mut m);
                 }
                 None => return,
             }
@@ -217,16 +214,7 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
         // Take everything that has arrived without blocking, so the jitter buffer
         // sees arrivals promptly and in order.
         while let Ok(event) = src_rx.try_recv() {
-            let t = start.elapsed().as_millis() as u64;
-            on_event(
-                event,
-                t,
-                &mut jb,
-                &mut est,
-                &mut m,
-                &mut generation_resets_seen,
-                &mut timeline_reset_due,
-            );
+            timeline_reset_due |= on_event(event, now_ms(), &mut jb, &mut est, &mut m);
         }
 
         if timeline_reset_due {
@@ -250,7 +238,7 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
         // the way down to the lower clamp over a 12.5 s outage, so recovery began by
         // running *backwards* — occupancy then grew by another 150 ms and a backlog
         // that was exactly within the lossless budget tripped the overflow trim.
-        let t = start.elapsed().as_millis() as u64;
+        let t = now_ms();
         if jb.state() != JitterState::Normal {
             last_ctl_ms = t;
         }
@@ -275,7 +263,7 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
         }
 
         // One release per accepted write: the consumer paces this.
-        let now = start.elapsed().as_millis() as u64;
+        let now = now_ms();
         match jb.release_with_target(now, target_packets) {
             Released::Real(p) => refr.push_audible(&p),
             Released::Repeat(p) => {
@@ -307,15 +295,17 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
             }
         }
 
-        // Counters the jitter buffer owns. Copied rather than incremented here so
-        // there is one source of truth for each; the JSONL reported zeroes for all
-        // four while the buffer had been counting them all along.
-        m.late_discards = jb.late_discards;
-        m.duplicate_discards = jb.duplicate_discards;
-        m.resync_events = jb.resync_events;
-
-        let t = start.elapsed().as_millis() as u64;
+        let t = now_ms();
         if m.flush_due(t, METRICS_INTERVAL_MS) {
+            // These three counters are the jitter buffer's, mirrored at flush time so
+            // each has one owner; the JSONL once reported zeroes for all of them while
+            // the buffer had been counting all along. Only these three: the metrics
+            // fields named conceal_events and outage_events are *pipeline* definitions
+            // (a Repeat release; the estimator's delay classification) and genuinely
+            // differ from the buffer's same-named internal counters.
+            m.late_discards = jb.late_discards;
+            m.duplicate_discards = jb.duplicate_discards;
+            m.resync_events = jb.resync_events;
             m.set_last_flush(t);
             let line = m.to_json_line(t, est.target_ms(), ctl.step());
             eprintln!("{}", line);

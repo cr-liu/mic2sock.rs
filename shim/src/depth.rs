@@ -19,7 +19,6 @@ pub enum Arrival {
 pub struct DepthEstimator {
     d_max_adaptive_ms: u64,
     packet_ms: u64,
-    window_ms: u64,
     /// (now_ms, d) of jitter-classified arrivals inside the window.
     samples: std::collections::VecDeque<(u64, i64)>,
     /// Delay an on-time packet would have. See [`DepthEstimator::reference`].
@@ -60,7 +59,6 @@ impl DepthEstimator {
         DepthEstimator {
             d_max_adaptive_ms,
             packet_ms,
-            window_ms: WINDOW_MS,
             samples: std::collections::VecDeque::new(),
             ref_ms: None,
             ref_updated_ms: 0,
@@ -81,12 +79,10 @@ impl DepthEstimator {
     ///
     /// * `now_ms` — local monotonic arrival time.
     /// * `header_ms` — the packet header's timestamp, on the sender's clock.
-    /// * `_reserved` — kept at 0; present so the signature does not churn when
-    ///   per-source statistics are added.
     ///
     /// The absolute difference is meaningless because the clocks are offset, so
     /// only its excess over the windowed minimum is used.
-    pub fn observe(&mut self, now_ms: u64, header_ms: u64, _reserved: u8) -> Arrival {
+    pub fn observe(&mut self, now_ms: u64, header_ms: u64) -> Arrival {
         let d = now_ms as i64 - header_ms as i64;
 
         // Monotonic time is a precondition. If it is violated the ordering the
@@ -105,7 +101,7 @@ impl DepthEstimator {
         // drifted, and letting a drifted sample set `w` would inflate the target
         // with no jitter having occurred.
         while let Some(&(t, _)) = self.samples.front() {
-            if now_ms.saturating_sub(t) > self.window_ms {
+            if now_ms.saturating_sub(t) > WINDOW_MS {
                 self.samples.pop_front();
             } else {
                 break;
@@ -209,16 +205,20 @@ impl DepthEstimator {
     }
 
     fn recompute(&mut self, now_ms: u64) {
-        let d_min = match self.samples.iter().map(|&(_, d)| d).min() {
-            Some(m) => m,
+        // One pass for both ends: since d_min is the window minimum, the spread
+        // max(d - d_min) is exactly d_max - d_min. The window holds up to 3,000
+        // samples at 100 pps, and this runs per arrival, so one scan, not two.
+        let mut ds = self.samples.iter().map(|&(_, d)| d);
+        let first = match ds.next() {
+            Some(d) => d,
             None => return,
         };
-        let w = self
-            .samples
-            .iter()
-            .map(|&(_, d)| (d - d_min).max(0) as u64)
-            .max()
-            .unwrap_or(0);
+        let (mut d_min, mut d_max) = (first, first);
+        for d in ds {
+            d_min = d_min.min(d);
+            d_max = d_max.max(d);
+        }
+        let w = (d_max - d_min) as u64;
         let want = (w + 2 * self.packet_ms).min(self.d_max_adaptive_ms);
 
         if want > self.target_ms {
@@ -258,10 +258,7 @@ mod tests {
     #[test]
     fn first_arrival_gives_the_floor_target() {
         let mut e = est();
-        assert_eq!(
-            e.observe(1000, 1000, 0),
-            Arrival::Jitter { above_min_ms: 0 }
-        );
+        assert_eq!(e.observe(1000, 1000), Arrival::Jitter { above_min_ms: 0 });
         // w = 0, plus the 2-packet margin.
         assert_eq!(e.target_ms(), 20);
     }
@@ -273,12 +270,12 @@ mod tests {
         let mut a = est();
         let mut b = est();
         for k in 0..50u64 {
-            a.observe(1000 + k * 10, 1000 + k * 10, 0);
+            a.observe(1000 + k * 10, 1000 + k * 10);
             // b's header timestamps are offset by a fixed +500000 ms. The
             // direction is arbitrary -- what matters is that a constant offset
             // shifts every `d` equally, so `d - d_min` is untouched. Offsetting
             // forward keeps the expression inside u64.
-            b.observe(1000 + k * 10, 1000 + k * 10 + 500_000, 0);
+            b.observe(1000 + k * 10, 1000 + k * 10 + 500_000);
         }
         assert_eq!(a.target_ms(), b.target_ms());
     }
@@ -286,12 +283,9 @@ mod tests {
     #[test]
     fn jitter_within_threshold_raises_the_target() {
         let mut e = est();
-        e.observe(1000, 1000, 0);
+        e.observe(1000, 1000);
         // 40 ms late relative to the minimum.
-        assert_eq!(
-            e.observe(1050, 1010, 0),
-            Arrival::Jitter { above_min_ms: 40 }
-        );
+        assert_eq!(e.observe(1050, 1010), Arrival::Jitter { above_min_ms: 40 });
         assert_eq!(e.target_ms(), 40 + 20);
     }
 
@@ -300,10 +294,10 @@ mod tests {
     #[test]
     fn an_outage_is_excluded_from_the_target() {
         let mut e = est();
-        e.observe(1000, 1000, 0);
+        e.observe(1000, 1000);
         let before = e.target_ms();
         assert_eq!(
-            e.observe(2000, 1000, 0),
+            e.observe(2000, 1000),
             Arrival::Outage { above_min_ms: 1000 }
         );
         assert_eq!(e.target_ms(), before, "an outage inflated the target");
@@ -318,13 +312,13 @@ mod tests {
     #[test]
     fn a_sustained_outage_is_excluded_packet_after_packet() {
         let mut e = est();
-        e.observe(0, 0, 0);
+        e.observe(0, 0);
         assert_eq!(e.target_ms(), 20);
 
         for k in 0..5u64 {
             let t = WINDOW_MS + 1 + k * 10;
             assert_eq!(
-                e.observe(t, t - 1000, 0),
+                e.observe(t, t - 1000),
                 Arrival::Outage { above_min_ms: 1000 },
                 "late packet {} slipped in as jitter once the window emptied",
                 k
@@ -333,7 +327,7 @@ mod tests {
         }
 
         // The following normal arrival must not find any of them in the window.
-        e.observe(WINDOW_MS + 101, WINDOW_MS + 101, 0);
+        e.observe(WINDOW_MS + 101, WINDOW_MS + 101);
         assert_eq!(e.target_ms(), 20, "the outage contaminated the window");
     }
 
@@ -350,18 +344,18 @@ mod tests {
     #[test]
     fn the_surviving_reference_is_the_minimum_not_the_newest() {
         let mut e = est();
-        e.observe(1000, 1000, 0); // d = 0
-        e.observe(1010, 990, 0); // d = 20
-        e.observe(1020, 1000, 0); // captures a window whose min is 0 and newest 20
+        e.observe(1000, 1000); // d = 0
+        e.observe(1010, 990); // d = 20
+        e.observe(1020, 1000); // captures a window whose min is 0 and newest 20
         assert_eq!(e.target_ms(), 40);
 
         let t = WINDOW_MS + 1021;
         assert_eq!(
-            e.observe(t, t - 90, 0),
+            e.observe(t, t - 90),
             Arrival::Outage { above_min_ms: 90 },
             "measured against the newest sample instead of the minimum"
         );
-        e.observe(t + 10, t + 10, 0);
+        e.observe(t + 10, t + 10);
         assert!(e.target_ms() <= 40, "target rose to {}", e.target_ms());
     }
 
@@ -371,19 +365,19 @@ mod tests {
     #[test]
     fn a_permanently_changed_offset_re_baselines_instead_of_never_recovering() {
         let mut e = est();
-        e.observe(0, 0, 0);
+        e.observe(0, 0);
 
         // +500 ms of offset, arriving steadily. The first is indistinguishable
         // from an outage, and so is the one after the window has emptied.
         let t0 = 1000;
-        assert!(matches!(e.observe(t0, t0 - 500, 0), Arrival::Outage { .. }));
+        assert!(matches!(e.observe(t0, t0 - 500), Arrival::Outage { .. }));
         let t1 = WINDOW_MS + 1000;
-        assert!(matches!(e.observe(t1, t1 - 500, 0), Arrival::Outage { .. }));
+        assert!(matches!(e.observe(t1, t1 - 500), Arrival::Outage { .. }));
 
         // Past the expiry it re-baselines, so the statistic works again.
         let t2 = REF_EXPIRY_MS + 1001;
         assert_eq!(
-            e.observe(t2, t2 - 500, 0),
+            e.observe(t2, t2 - 500),
             Arrival::Jitter { above_min_ms: 0 },
             "the reference never expired, so every arrival stayed an outage"
         );
@@ -396,13 +390,13 @@ mod tests {
     #[test]
     fn a_rollback_does_not_freeze_the_target_at_its_peak() {
         let mut e = est();
-        e.observe(100_000, 100_000, 0);
-        e.observe(100_060, 100_000, 0);
+        e.observe(100_000, 100_000);
+        e.observe(100_060, 100_000);
         assert_eq!(e.target_ms(), 80);
 
-        e.observe(0, 0, 0);
+        e.observe(0, 0);
         for k in 1..=7u64 {
-            e.observe(k * SHRINK_INTERVAL_MS, k * SHRINK_INTERVAL_MS, 0);
+            e.observe(k * SHRINK_INTERVAL_MS, k * SHRINK_INTERVAL_MS);
         }
         assert!(e.target_ms() < 80, "target stuck at {}", e.target_ms());
     }
@@ -413,14 +407,11 @@ mod tests {
     #[test]
     fn a_stale_reference_does_not_inflate_the_spread() {
         let mut e = est();
-        e.observe(0, 0, 0);
+        e.observe(0, 0);
         // 30 ms of accumulated drift after a long gap: within the threshold, so
         // it is recorded -- but it is then the only sample, so the spread is 0.
         let t = 2 * WINDOW_MS;
-        assert_eq!(
-            e.observe(t, t - 30, 0),
-            Arrival::Jitter { above_min_ms: 30 }
-        );
+        assert_eq!(e.observe(t, t - 30), Arrival::Jitter { above_min_ms: 30 });
         assert_eq!(e.sample_count(), 1, "the stale sample was kept");
         assert_eq!(e.target_ms(), 20, "drift alone deepened the buffer");
     }
@@ -432,17 +423,17 @@ mod tests {
     #[test]
     fn a_new_minimum_becomes_the_reference_immediately() {
         let mut e = est();
-        e.observe(1000, 980, 0); // d = 20
-        e.observe(1010, 1010, 0); // d = 0, the new minimum
+        e.observe(1000, 980); // d = 20
+        e.observe(1010, 1010); // d = 0, the new minimum
         assert_eq!(e.target_ms(), 40);
 
         let t = WINDOW_MS + 1011;
         assert_eq!(
-            e.observe(t, t - 90, 0),
+            e.observe(t, t - 90),
             Arrival::Outage { above_min_ms: 90 },
             "measured against a reference one sample stale"
         );
-        e.observe(t + 10, t + 10, 0);
+        e.observe(t + 10, t + 10);
         assert!(e.target_ms() <= 40, "target rose to {}", e.target_ms());
     }
 
@@ -452,14 +443,11 @@ mod tests {
     #[test]
     fn a_downward_offset_step_does_not_manufacture_jitter() {
         let mut e = est();
-        e.observe(1000, 1000, 0); // d = 0
+        e.observe(1000, 1000); // d = 0
         assert_eq!(e.target_ms(), 20);
 
         // The sender restarts with its clock 500 ms further ahead: d steps to -500.
-        assert_eq!(
-            e.observe(1010, 1510, 0),
-            Arrival::Jitter { above_min_ms: 0 }
-        );
+        assert_eq!(e.observe(1010, 1510), Arrival::Jitter { above_min_ms: 0 });
         assert_eq!(e.sample_count(), 1, "the old offset's samples were kept");
         assert_eq!(
             e.target_ms(),
@@ -474,15 +462,15 @@ mod tests {
     #[test]
     fn an_outage_does_not_extend_the_references_life() {
         let mut e = est();
-        e.observe(0, 0, 0);
+        e.observe(0, 0);
         // An outage at the inclusive edge of the window: the sample is still there,
         // but this call must not count as fresh evidence.
         assert!(matches!(
-            e.observe(WINDOW_MS, WINDOW_MS - 500, 0),
+            e.observe(WINDOW_MS, WINDOW_MS - 500),
             Arrival::Outage { .. }
         ));
         assert_eq!(
-            e.observe(REF_EXPIRY_MS + 1, REF_EXPIRY_MS + 1 - 500, 0),
+            e.observe(REF_EXPIRY_MS + 1, REF_EXPIRY_MS + 1 - 500),
             Arrival::Jitter { above_min_ms: 0 },
             "the reference outlived REF_EXPIRY_MS measured from its last sample"
         );
@@ -494,15 +482,15 @@ mod tests {
     #[test]
     fn a_generation_reset_re_baselines_the_reference() {
         let mut e = est();
-        e.observe(1000, 1000, 0);
+        e.observe(1000, 1000);
         assert!(matches!(
-            e.observe(1010, 510, 0),
+            e.observe(1010, 510),
             Arrival::Outage { above_min_ms: 500 }
         ));
 
         e.on_generation_reset();
         assert_eq!(
-            e.observe(1020, 520, 0),
+            e.observe(1020, 520),
             Arrival::Jitter { above_min_ms: 0 },
             "a generation reset did not re-baseline"
         );
@@ -517,10 +505,10 @@ mod tests {
     #[test]
     fn an_ordinary_stall_keeps_the_reference_that_measures_it() {
         let mut e = est();
-        e.observe(1000, 950, 0); // d = 50
-                                 // One second of stall, then the backlog arrives: same sender, same clock.
+        e.observe(1000, 950); // d = 50
+                              // One second of stall, then the backlog arrives: same sender, same clock.
         assert_eq!(
-            e.observe(2000, 950, 0),
+            e.observe(2000, 950),
             Arrival::Outage { above_min_ms: 1000 },
             "the stalled packet was admitted as jitter"
         );
@@ -535,14 +523,14 @@ mod tests {
         // A rising staircase: each sample is 10 ms later than the last, so the
         // window's minimum climbs as the early samples age out.
         for k in 0..6u64 {
-            e.observe(k * 10_000, k * 10_000 - k * 10, 0);
+            e.observe(k * 10_000, k * 10_000 - k * 10);
         }
         // By the last of those the window held delays 20..50, so the durable
         // reference is 20 rather than the original 0. A delay of 95 is then 75 above
         // it — jitter — where against a reference stuck at 0 it would be an outage.
         let t = 80_001;
         assert_eq!(
-            e.observe(t, t - 95, 0),
+            e.observe(t, t - 95),
             Arrival::Jitter { above_min_ms: 75 },
             "the durable reference lagged the window's minimum"
         );
@@ -554,10 +542,10 @@ mod tests {
     #[test]
     fn accepted_samples_wind_the_expiry_clock() {
         let mut e = est();
-        e.observe(0, 0, 0);
-        e.observe(100_000, 100_000, 0);
+        e.observe(0, 0);
+        e.observe(100_000, 100_000);
         assert_eq!(
-            e.observe(300_001, 300_001 - 500, 0),
+            e.observe(300_001, 300_001 - 500),
             Arrival::Outage { above_min_ms: 500 },
             "the reference expired measured from the first sample"
         );
@@ -568,8 +556,8 @@ mod tests {
     #[test]
     fn a_step_exactly_at_the_threshold_is_still_jitter() {
         let mut e = est();
-        e.observe(1000, 1000, 0); // d = 0
-        e.observe(1010, 1090, 0); // d = -80: exactly the threshold
+        e.observe(1000, 1000); // d = 0
+        e.observe(1010, 1090); // d = -80: exactly the threshold
         assert_eq!(
             e.sample_count(),
             2,
@@ -582,10 +570,10 @@ mod tests {
     #[test]
     fn time_going_backwards_discards_the_window_instead_of_wedging_it() {
         let mut e = est();
-        e.observe(100_000, 100_000, 0);
-        e.observe(0, 0, 0);
+        e.observe(100_000, 100_000);
+        e.observe(0, 0);
         assert_eq!(e.sample_count(), 1, "the future-dated sample was retained");
-        e.observe(WINDOW_MS + 1, WINDOW_MS + 1, 0);
+        e.observe(WINDOW_MS + 1, WINDOW_MS + 1);
         assert_eq!(e.sample_count(), 1, "eviction stopped at a future sample");
     }
 
@@ -600,9 +588,9 @@ mod tests {
     #[test]
     fn target_is_capped_at_d_max_adaptive() {
         let mut e = est();
-        e.observe(1000, 1000, 0);
+        e.observe(1000, 1000);
         // 79 ms is still jitter, but 79 + 20 margin exceeds the 80 ms cap.
-        e.observe(1079, 1000, 0);
+        e.observe(1079, 1000);
         assert_eq!(e.target_ms(), 80);
     }
 
@@ -611,7 +599,7 @@ mod tests {
     #[test]
     fn a_conceal_event_deepens_the_target_immediately() {
         let mut e = est();
-        e.observe(1000, 1000, 0);
+        e.observe(1000, 1000);
         let before = e.target_ms();
         e.on_conceal(1001);
         assert!(e.target_ms() > before, "conceal did not deepen the target");
@@ -622,28 +610,28 @@ mod tests {
     #[test]
     fn shrink_is_rate_limited_but_growth_is_not() {
         let mut e = est();
-        e.observe(0, 0, 0);
-        e.observe(60, 0, 0); // w = 60 -> target 80 (capped)
+        e.observe(0, 0);
+        e.observe(60, 0); // w = 60 -> target 80 (capped)
         assert_eq!(e.target_ms(), 80);
 
         // The window slides past those samples, so w collapses to 0.
         let t = WINDOW_MS + 1000;
-        e.observe(t, t, 0);
+        e.observe(t, t);
         // Only one packet may be shed, and only once per SHRINK_INTERVAL_MS.
         assert_eq!(e.target_ms(), 70, "shrank by more than one packet");
-        e.observe(t + 1, t + 1, 0);
+        e.observe(t + 1, t + 1);
         assert_eq!(e.target_ms(), 70, "shrank twice inside the interval");
-        e.observe(t + SHRINK_INTERVAL_MS, t + SHRINK_INTERVAL_MS, 0);
+        e.observe(t + SHRINK_INTERVAL_MS, t + SHRINK_INTERVAL_MS);
         assert_eq!(e.target_ms(), 60);
     }
 
     #[test]
     fn samples_older_than_the_window_are_dropped() {
         let mut e = est();
-        e.observe(0, 0, 0);
-        e.observe(50, 0, 0);
+        e.observe(0, 0);
+        e.observe(50, 0);
         assert_eq!(e.sample_count(), 2);
-        e.observe(WINDOW_MS + 51, WINDOW_MS + 51, 0);
+        e.observe(WINDOW_MS + 51, WINDOW_MS + 51);
         assert_eq!(e.sample_count(), 1, "stale samples were not evicted");
     }
 }

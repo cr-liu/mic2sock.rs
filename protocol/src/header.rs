@@ -25,6 +25,17 @@ impl Header {
         buf[8..12].copy_from_slice(&self.pkt_id.to_le_bytes());
     }
 
+    /// Milliseconds since the Unix epoch named by this header.
+    ///
+    /// `ms` is signed on the wire, so the sum is computed in `i64` and clamped at
+    /// zero — the sender never emits a negative `ms` (it borrows from `secs`
+    /// instead), but a parser must not underflow on one. This is the one place
+    /// that clamping rule lives; before it existed, two callers had invented two
+    /// different rules.
+    pub fn epoch_ms(&self) -> u64 {
+        (self.secs as i64 * 1000 + self.ms as i64).max(0) as u64
+    }
+
     /// Parses the first `HEADER_LEN` bytes of `buf`; returns `None` if too short.
     ///
     /// Note the receive side's `header_len` may exceed 12 (`tcp_receiver.header_len`
@@ -40,6 +51,23 @@ impl Header {
             ms: i16::from_le_bytes(buf[6..8].try_into().unwrap()),
             pkt_id: i32::from_le_bytes(buf[8..12].try_into().unwrap()),
         })
+    }
+}
+
+/// The sender's successor for a wire packet id.
+///
+/// `mic2sock`'s `process_send_buf` walks `0, 1, …, i32::MAX - 1` and then returns
+/// to 0 — `i32::MAX` itself never appears on the wire — so the successor of
+/// `i32::MAX - 1` is `0`. This one wire fact was once written out independently in
+/// four places; if the Pi ever changes its reset point, this is the only line to
+/// touch. Wrapping add, so an (invalid) `i32::MAX` input cannot panic a debug
+/// build in the middle of validating a malformed stream.
+pub fn next_pkt_id(id: i32) -> i32 {
+    let n = id.wrapping_add(1);
+    if n == i32::MAX {
+        0
+    } else {
+        n
     }
 }
 
@@ -109,6 +137,28 @@ mod tests {
                 pkt_id: 0x1234_5678,
             })
         );
+    }
+
+    #[test]
+    fn the_wire_id_wraps_at_i32_max() {
+        assert_eq!(next_pkt_id(0), 1);
+        assert_eq!(next_pkt_id(i32::MAX - 2), i32::MAX - 1);
+        assert_eq!(next_pkt_id(i32::MAX - 1), 0, "i32::MAX never appears");
+    }
+
+    #[test]
+    fn epoch_ms_combines_and_clamps() {
+        let mut h = Header {
+            device_id: 1,
+            secs: 100,
+            ms: 250,
+            pkt_id: 0,
+        };
+        assert_eq!(h.epoch_ms(), 100_250);
+        // Negative ms never comes off the wire, but must not underflow if it does.
+        h.secs = 0;
+        h.ms = -5;
+        assert_eq!(h.epoch_ms(), 0);
     }
 
     #[test]

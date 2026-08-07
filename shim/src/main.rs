@@ -1,6 +1,10 @@
 use shim_lib::{config, pipeline};
 use std::path::PathBuf;
 
+/// Exit code for a missing, malformed or invalid config — and for a usage error,
+/// which is the same class of operator mistake. Codes 3 and 4 live in `pipeline`.
+const EXIT_CONFIG: i32 = 2;
+
 fn main() {
     let explicit = parse_config_arg();
     let cfg = match config::load(explicit.as_deref()) {
@@ -10,7 +14,7 @@ fn main() {
             // makes a misconfiguration look like a runtime mystery instead of a
             // startup error.
             eprintln!("shim: {}", e);
-            std::process::exit(2);
+            std::process::exit(EXIT_CONFIG);
         }
     };
     eprintln!(
@@ -44,13 +48,13 @@ fn parse_config_arg() -> Option<PathBuf> {
                         "shim: unexpected argument {:?} after --config <path>",
                         extra
                     );
-                    std::process::exit(2);
+                    std::process::exit(EXIT_CONFIG);
                 }
                 Some(PathBuf::from(p))
             }
             None => {
                 eprintln!("shim: --config needs a path");
-                std::process::exit(2);
+                std::process::exit(EXIT_CONFIG);
             }
         },
         Some(other) => {
@@ -58,7 +62,7 @@ fn parse_config_arg() -> Option<PathBuf> {
                 "shim: unexpected argument {:?}; usage: shim [--config <path>]",
                 other
             );
-            std::process::exit(2);
+            std::process::exit(EXIT_CONFIG);
         }
     }
 }

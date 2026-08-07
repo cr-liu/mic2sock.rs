@@ -11,9 +11,4 @@ pub mod reframe;
 pub mod sink;
 pub mod source;
 
-pub use config::Config;
-
-/// Parses a config from TOML text.
-pub fn parse_config(text: &str) -> Result<Config, String> {
-    config::parse(text)
-}
+pub use config::{parse as parse_config, Config};
