@@ -55,6 +55,14 @@ impl TcpServer {
             let socket = self.accept().await?;
             socket.set_nodelay(true)?;
             let ip_addr = socket.peer_addr().unwrap().to_string();
+            // Mark the audio stream CS6 (TOS 0xC0) so the Wi-Fi stack queues it as
+            // 802.11 AC_VO. Linux maps the TOS precedence bits to the WMM access
+            // category (cfg80211_classify8021d), and EDCA arbitration then wins the
+            // air against bulk best-effort traffic -- ours and neighbours' alike.
+            // DSCP EF would only reach AC_VI under that default mapping, hence CS6.
+            if let Err(err) = socket2::SockRef::from(&socket).set_tos(0xC0) {
+                println!("failed to set IP_TOS for {}: {}", ip_addr, err);
+            }
 
             let mut handler = SocketHandler {
                 ip_addr,
