@@ -18,10 +18,10 @@ sink_port = 7998
 # These must equal the values the consumer was built for; the shim refuses to start
 # otherwise, because the consumer parses by fixed byte offset and cannot report a
 # disagreement -- it would just mis-read every field of every packet, forever.
-# The packet length is derived from them (17 * 160 * 2 + 12 = 5452 bytes), never
+# The packet length is derived from them (16 * 160 * 2 + 12 = 5132 bytes), never
 # hardcoded. A different array means changing the CONSUMER_* constants in
 # shim/src/config.rs and rebuilding the consumer to match.
-n_ch = 17
+n_ch = 16
 spp_out = 160
 header_len = 12
 sample_rate = 16000

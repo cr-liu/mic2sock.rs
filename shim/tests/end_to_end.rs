@@ -9,8 +9,8 @@
 //! a "free" port, which would race the next test picking it up before this one
 //! rebinds it.
 //!
-//! The geometry is the real, pinned production shape (17 channels, 160
-//! samples/packet, 5452-byte packets): `Config::validate` refuses anything
+//! The geometry is the real, pinned production shape (16 channels, 160
+//! samples/packet, 5132-byte packets): `Config::validate` refuses anything
 //! smaller, so there is no scaled-down geometry available to test against.
 
 use protocol::block::{deblock_channel, reblock_channel};
@@ -25,7 +25,7 @@ use tokio::time::timeout;
 /// `header_len`/`sample_rate` to exactly these values, so this is not a choice
 /// -- it is the only shape `parse_config` will accept.
 fn layout() -> PacketLayout {
-    PacketLayout::new(17, 160, 12)
+    PacketLayout::new(16, 160, 12)
 }
 
 /// Builds one well-formed input packet. Every channel carries the same 0..spp

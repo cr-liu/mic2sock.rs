@@ -78,7 +78,7 @@ fn default_sink_port() -> u16 {
     7998
 }
 fn default_n_ch() -> usize {
-    17
+    16
 }
 fn default_spp_out() -> usize {
     160
@@ -121,7 +121,7 @@ use protocol::{PacketLayout, HEADER_LEN};
 /// Constants rather than free parameters, because the black box is closed-source
 /// and parses by byte offset: it cannot report a disagreement, it just mis-reads
 /// every field of every packet for as long as the shim runs. The three values
-/// stay in `shim.toml` so the packet length is still *derived* — 5452 is never
+/// stay in `shim.toml` so the packet length is still *derived* — 5132 is never
 /// hardcoded, per spec §6.7 — but one that disagrees with the consumer is refused
 /// at load. Changing the rig means changing these and rebuilding the consumer;
 /// that coupling is real, and naming it is more honest than accepting a geometry
@@ -130,7 +130,7 @@ use protocol::{PacketLayout, HEADER_LEN};
 /// This does not remove the need for the runtime cross-check in `source.rs`: the
 /// Pi clamps `mic.n_channel` down to whatever the hardware enumerates, so the
 /// stream can disagree with a config that is internally valid.
-const CONSUMER_N_CH: usize = 17;
+const CONSUMER_N_CH: usize = 16;
 const CONSUMER_SPP_OUT: usize = 160;
 const CONSUMER_SAMPLE_RATE: usize = 16_000;
 const CONSUMER_PACKET_LEN: usize =
@@ -323,7 +323,7 @@ source_port = 7998
         assert_eq!(c.source_host, "192.168.1.50");
         assert_eq!(c.source_port, 7998);
         assert_eq!(c.sink_port, 7998);
-        assert_eq!(c.n_ch, 17);
+        assert_eq!(c.n_ch, 16);
         assert_eq!(c.spp_out, 160);
         assert_eq!(c.header_len, 12);
         assert_eq!(c.d_max_adaptive_ms, 80);
@@ -340,12 +340,12 @@ source_port = 7998
         parse(&format!("{}{}\n", MINIMAL, extra))
     }
 
-    /// The production geometry, derived rather than hardcoded. 5452 is what the
+    /// The production geometry, derived rather than hardcoded. 5132 is what the
     /// closed-source consumer expects.
     #[test]
     fn derives_the_production_packet_length() {
         let c: Config = parse(MINIMAL).unwrap();
-        assert_eq!(c.layout().packet_len(), 5452);
+        assert_eq!(c.layout().packet_len(), 5132);
     }
 
     #[test]
@@ -379,26 +379,26 @@ source_port = 7998
     /// The geometry is what the closed-source consumer parses by fixed byte
     /// offset, and it cannot report a disagreement — it just mis-reads every
     /// field forever. So every value is held to the deployed rig, not merely
-    /// bounded: `n_ch = 16` (5132 bytes) is exactly as fatal as `header_len = 13`
-    /// (5453 bytes), and bounding one while allowing the other was incoherent.
+    /// bounded: `n_ch = 17` (5452 bytes) is exactly as fatal as `header_len = 13`
+    /// (5133 bytes), and bounding one while allowing the other was incoherent.
     #[test]
     fn a_geometry_the_consumer_cannot_parse_is_rejected() {
         for bad in [
             "header_len = 13",
             "header_len = 16",
-            "n_ch = 16",
+            "n_ch = 17",
             "n_ch = 18",
             "spp_out = 320",
             "spp_out = 100",
             "sample_rate = 48000",
         ] {
             let e = with(bad).unwrap_err();
-            assert!(e.contains("5452"), "{} -> {}", bad, e);
+            assert!(e.contains("5132"), "{} -> {}", bad, e);
         }
         // Stating the deployed values explicitly must still parse, and the packet
         // length must still be derived from them rather than hardcoded.
-        let c = with("header_len = 12\nn_ch = 17\nspp_out = 160\nsample_rate = 16000").unwrap();
-        assert_eq!(c.layout().packet_len(), 5452);
+        let c = with("header_len = 12\nn_ch = 16\nspp_out = 160\nsample_rate = 16000").unwrap();
+        assert_eq!(c.layout().packet_len(), 5132);
     }
 
     /// Unbounded geometry turned a typo into a panic (debug) or a wrapped frame
@@ -485,7 +485,7 @@ source_port = 7998
     fn the_shipped_example_config_parses() {
         let example = include_str!("../shim.toml.example");
         let c = parse(example).expect("shim.toml.example must be valid");
-        assert_eq!(c.layout().packet_len(), 5452);
+        assert_eq!(c.layout().packet_len(), 5132);
         // And the values it documents are the ones the code defaults to, so the
         // example never quietly disagrees with the built-in behaviour.
         let defaults = parse(MINIMAL).unwrap();

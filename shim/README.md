@@ -8,8 +8,8 @@ Pi (mic2sock) ──TCP over Wi-Fi──▶ shim.exe ──TCP over localhost─
 ```
 
 The consumer is pointed at `127.0.0.1` instead of at the Pi, and gets a stream in
-exactly the format it already parses: same 12-byte header, same 17 channels, same 160
-samples per packet, same 5452 bytes. Nothing about it has to change.
+exactly the format it already parses: same 12-byte header, same 16 channels, same 160
+samples per packet, same 5132 bytes. Nothing about it has to change.
 
 ## What it is for
 
