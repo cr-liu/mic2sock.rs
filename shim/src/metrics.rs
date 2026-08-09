@@ -22,6 +22,11 @@ pub struct Metrics {
     pub catchup_overflow: u64,
     /// Should stay 0. Non-zero means the consumer stopped reading.
     pub max_depth_hit: u64,
+    /// Packets released as pure silence (outage or priming). The bench showed a
+    /// 20%-silence output with every other counter green: silence is not a
+    /// conceal (that counts Repeat only), so without its own counter the JSONL
+    /// cannot distinguish a healthy stream from one that is mostly dead air.
+    pub silence_packets: u64,
     last_flush_ms: u64,
 }
 
@@ -43,6 +48,7 @@ impl Default for Metrics {
             duplicate_discards: 0,
             catchup_overflow: 0,
             max_depth_hit: 0,
+            silence_packets: 0,
             last_flush_ms: 0,
         }
     }
@@ -126,6 +132,7 @@ impl Metrics {
                 "\"conceal_samples\":{},\"outage_events\":{},\"resync_events\":{},",
                 "\"late_discards\":{},\"duplicate_discards\":{},",
                 "\"catchup_overflow\":{},\"max_depth_hit\":{},",
+                "\"silence_packets\":{},",
                 "\"d_target_ms\":{},\"step\":{},",
                 "\"p50_ms\":{},\"p99_ms\":{},\"p99_9_ms\":{}}}"
             ),
@@ -139,6 +146,7 @@ impl Metrics {
             self.duplicate_discards,
             self.catchup_overflow,
             self.max_depth_hit,
+            self.silence_packets,
             d_target_ms,
             step,
             self.percentile_ms(50.0),
@@ -330,6 +338,7 @@ mod tests {
                 "duplicate_discards",
                 "catchup_overflow",
                 "max_depth_hit",
+                "silence_packets",
                 "d_target_ms",
                 "step",
                 "p50_ms",

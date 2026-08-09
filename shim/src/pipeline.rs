@@ -3,23 +3,19 @@
 //! Lives in the library rather than in `main.rs` so an integration test can drive it
 //! directly; a binary crate's modules cannot be reached from `tests/`.
 //!
-//! **The release rate is the consumer's read rate.** There is no timer in this loop:
-//! one packet is released per accepted sink write. Windows' default timer granularity is
-//! 15.6 ms against a 10 ms packet, so a timer-driven design would add more jitter than
-//! the network does.
+//! **The release clock is the shim's own pacer** — one tick per packet duration on a
+//! dedicated OS thread (see `spawn_pacer`). The consumer's read behaviour is deliberately
+//! NOT trusted: the black box is closed-source, and an earlier consumer-paced design
+//! (release per accepted sink write) put the whole depth-control loop at the mercy of an
+//! unverifiable assumption — a consumer that reads flat out would pin the controller at
+//! its lower clamp and hold depth at zero, which the bench reproduced. Self-pacing keeps
+//! every property we can control on our side: a greedy reader is simply served in real
+//! time, a paced reader waits ~0 per read, and a stalled reader backs the sink queue up,
+//! which stalls releases and lets depth (and then the valve) absorb it.
 //!
-//! Be precise about what that bounds, though. `send().await` returns when the sink task
-//! *dequeues*, and its `write_all` returns when the local TCP stack accepts the bytes —
-//! not when the consumer application reads them. Between the two-slot channel, the
-//! packet in the sink's write, and both kernel buffers (Linux doubled a 16 KB
-//! `SO_SNDBUF` request to 32 KB), a measured 11 packets — about 110 ms — crossed while a
-//! consumer read nothing. So this bounds the lead to a few packets rather than the three
-//! seconds a large queue would allow; it does not make a release equal a consumer read.
-//!
-//! It also assumes the consumer reads at its own audio rate. A consumer that reads flat
-//! out *is* the clock, and will be served flat out — the code cannot tell "feeding a
-//! bounded device queue" from "draining as fast as possible". That assumption holds for
-//! an audio consumer and has to be confirmed against the real one.
+//! The consumer-vs-pacer clock mismatch this reintroduces is the one the legacy direct
+//! connection always had (the consumer was paced by the robot's crystal then), and the
+//! depth controller steers the long-run release rate to the arrival rate anyway.
 
 use crate::config::Config;
 use crate::depth::{Arrival, DepthEstimator};
@@ -44,12 +40,10 @@ const MAX_CONCEAL_PACKETS: usize = 8;
 const REORDER_WINDOW: usize = 16;
 /// Depth of the channel to the sink, in packets.
 ///
-/// **Load-bearing, and small on purpose.** `send().await` on this channel is the
-/// release clock, so it has to block almost immediately: two slots let the sink write
-/// one packet while the loop prepares the next, and nothing more. Sizing it by the
-/// catchup budget instead — three seconds of packets — would let the loop run three
-/// seconds ahead of the consumer, and the pacing this whole design rests on would be
-/// the loop's own speed rather than the consumer's read rate.
+/// Small on purpose, though it is no longer the release clock (the pacer is): it
+/// bounds how far a stalled consumer can back audio up outside the jitter buffer.
+/// Everything past these two slots and the small SO_SNDBUF stays in the buffer,
+/// where depth accounting and the safety valve can see it.
 const SINK_QUEUE_PACKETS: usize = 2;
 /// Floor on the source channel's depth, in packets. The actual depth is derived
 /// from the config (see `run_with_sink`): this side must absorb a post-stall burst
@@ -134,6 +128,39 @@ fn on_event(
     }
 }
 
+/// The release clock: one tick per packet duration on an absolute schedule
+/// (t0 + n*period), so per-tick error never accumulates. A dedicated OS thread,
+/// not a tokio timer: tokio's timer on Windows is quantized to the ~15.6 ms
+/// system tick (tokio #5021), while `std::thread::sleep` has used a
+/// high-resolution waitable timer since Rust 1.75 (~0.5 ms on Windows 10
+/// 1803+). Build the Windows binary with a toolchain >= 1.75 or pacing
+/// degrades to the system tick.
+///
+/// The channel is shallow on purpose: if the pipeline falls behind, at most the
+/// channel's capacity in ticks is owed and replayed back-to-back; beyond that
+/// the pacer blocks, and the absolute schedule folds the excess away instead of
+/// letting lateness accumulate.
+fn spawn_pacer(period_ms: u64) -> mpsc::Receiver<()> {
+    let (tx, rx) = mpsc::channel(4);
+    std::thread::spawn(move || {
+        let t0 = Instant::now();
+        let mut n: u64 = 0;
+        loop {
+            n += 1;
+            let deadline = t0 + std::time::Duration::from_millis(n * period_ms);
+            let now = Instant::now();
+            if deadline > now {
+                std::thread::sleep(deadline - now);
+            }
+            if tx.blocking_send(()).is_err() {
+                // The pipeline is gone; the thread must not outlive it.
+                return;
+            }
+        }
+    });
+    rx
+}
+
 /// Runs against an already-bound sink.
 ///
 /// Split out so a test can bind port 0 itself, read back the assigned port, and pass
@@ -171,6 +198,7 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
     tokio::spawn(sink.run(sink_rx));
 
     let packet_ms = cfg.packet_ms();
+    let mut tick_rx = spawn_pacer(packet_ms);
     let mut est = DepthEstimator::new(cfg.d_max_adaptive_ms, packet_ms);
     let mut jb = JitterBuffer::new(
         cfg.outage_threshold_ms,
@@ -202,6 +230,9 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
         // the channel rather than polling is also what keeps this off a timer.
         if !connected.load(Ordering::Relaxed) {
             jb.retain_window(target_packets.max(1));
+            // Ticks that piled up while nobody was listening are stale; letting
+            // them queue would burst-release the moment a consumer appears.
+            while tick_rx.try_recv().is_ok() {}
             match src_rx.recv().await {
                 Some(ev) => {
                     timeline_reset_due |= on_event(ev, now_ms(), &mut jb, &mut est, &mut m);
@@ -211,8 +242,28 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
             continue;
         }
 
-        // Take everything that has arrived without blocking, so the jitter buffer
-        // sees arrivals promptly and in order.
+        // Wait for the release tick, but keep stamping arrivals while waiting --
+        // parking them in the channel for up to a full packet period would skew
+        // the delay statistic by that much.
+        loop {
+            tokio::select! {
+                biased;
+                ev = src_rx.recv() => match ev {
+                    Some(ev) => {
+                        timeline_reset_due |= on_event(ev, now_ms(), &mut jb, &mut est, &mut m);
+                    }
+                    None => return,
+                },
+                tick = tick_rx.recv() => {
+                    if tick.is_none() {
+                        return;
+                    }
+                    break;
+                }
+            }
+        }
+        // Take everything else that has arrived without blocking, so the jitter
+        // buffer sees arrivals promptly and in order.
         while let Ok(event) = src_rx.try_recv() {
             timeline_reset_due |= on_event(event, now_ms(), &mut jb, &mut est, &mut m);
         }
@@ -274,22 +325,23 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
                 // that has already been emitted and must not anchor the timeline.
                 refr.push_repeat(&p);
             }
-            Released::Silence => refr.push_silence(),
+            Released::Silence => {
+                m.silence_packets += 1;
+                refr.push_silence()
+            }
             Released::Nothing => {
-                // Nothing buffered and not yet an outage. This is the one wait in the
-                // loop, and it is a starvation guard rather than a clock: without a
-                // consumer-driven write to block on there is nothing to pace against,
-                // and spinning would burn a core for up to outage_threshold_ms.
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                // Nothing buffered and not yet an outage: skip this tick. The next
+                // tick is the wait -- no polling needed now that the loop is paced.
                 continue;
             }
         }
 
         refr.drain(ctl.step(), &mut pending);
         for p in pending.drain(..) {
-            // This await is the release clock: with a two-packet queue it returns only
-            // once the sink has taken the previous packet, and the sink's own write
-            // returns only once the consumer has.
+            // Usually instant (the queue is two deep and the consumer keeps up).
+            // When the consumer stalls this blocks, ticks coalesce in their shallow
+            // channel, and releases stop -- depth then grows where the accounting
+            // and the safety valve can see it.
             if sink_tx.send(p).await.is_err() {
                 return;
             }

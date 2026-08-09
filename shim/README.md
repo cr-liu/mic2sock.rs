@@ -29,6 +29,12 @@ given, when it is given it. The shim takes the burstiness on itself:
   price of losing nothing, and it was chosen deliberately.
 - **Output ids are the shim's own gapless sequence.** A concealed packet still carries
   a valid, consecutive id, because what the consumer does when an id jumps is unknown.
+- **Release is paced by the shim's own clock** — one packet per 10 ms on a dedicated
+  high-resolution timer thread. Nothing about the consumer's read behaviour is assumed
+  or trusted: a paced reader waits ~0 per read, a greedy reader is simply served in
+  real time, and a stalled reader backs releases up into the buffer where the depth
+  accounting and the safety valve can see it. (Requires building with Rust >= 1.75,
+  which gives `std::thread::sleep` ~0.5 ms precision on Windows 10 1803+.)
 
 ## Build and run
 
@@ -82,6 +88,11 @@ With `metrics_path` set, one JSON object is appended per minute. Three fields an
 - `max_depth_hit` — the safety valve fired, so the consumer stopped reading.
 - `resync_events` — the timeline was broken deliberately. A few after a sender restart
   are expected; a steady trickle is not.
+
+A fourth, `silence_packets`, should stay *near* zero: it counts packets released as
+pure silence (outage or priming). The counters above can all be green while a fifth
+of the output is dead air — silence is not a conceal — so this is the one that says
+whether the consumer actually received audio.
 
 And one answers "how good is this link, really": **`p99_9_ms`**, the 99.9th percentile
 of arrival delay above the running minimum. That number is what a buffer has to cover,
