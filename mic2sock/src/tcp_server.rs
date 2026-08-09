@@ -118,9 +118,19 @@ pub struct SocketHandler {
 impl SocketHandler {
     async fn run(&mut self) -> crate::Result<()> {
         while self.shutdown.load(Ordering::Relaxed) != true {
-            // self.notifyee.notified().await;
-            // let packet = self.packet_buf.load();
-            let packet = self.pkt_receiver.recv().await?;
+            // A client that stalls past the retained backlog loses exactly the
+            // overrun -- the stream resumes with a forward pkt_id jump that the
+            // consumer conceals in place. Killing the connection here instead
+            // (the old behaviour) also threw away the backlog that WAS retained,
+            // and forced a reconnect cycle on every Wi-Fi stall.
+            let packet = match self.pkt_receiver.recv().await {
+                Ok(p) => p,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    println!("{} lagged, {} packets dropped", self.ip_addr, n);
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            };
             tokio::select! {
                 // res = self.socket.write_all(packet.as_ref()) => {
                 res = self.socket.write_all(&packet) => {

@@ -41,7 +41,12 @@ async fn main() {
     let pkt_len = cfg.tcp_sender.header_len + n_mic * cfg.tcp_sender.sample_per_packet * 2;
     println!("Send {} channels with packet length {}", n_mic, pkt_len);
 
-    let (packet_sender, _keep_channel_open) = broadcast::channel(16);
+    // Per-client send backlog. The shim absorbs up to catchup_max = 3 s of
+    // backlog after a stall, and content is dropped at whichever end holds
+    // less (spec §6.2) -- so the sender must retain the same 3 s. At 10 ms a
+    // packet that is 300 packets, ~1.5 MB.
+    let backlog_packets = 3000 / (cfg.tcp_sender.sample_per_packet * 1000 / cfg.mic.sample_rate);
+    let (packet_sender, _keep_channel_open) = broadcast::channel(backlog_packets);
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let panic_flag = Arc::new(AtomicBool::new(false));
