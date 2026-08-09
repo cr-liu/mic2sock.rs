@@ -1,7 +1,6 @@
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-// use arc_swap::ArcSwap;
 // use tokio::sync::Notify;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
