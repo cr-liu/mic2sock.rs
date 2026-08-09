@@ -14,7 +14,11 @@ n_channel = 16
 use_alsa_out = false
 # device_name = "plughw:Generic_1"
 device_name = "plughw:Device"
-n_channel = 1
+# Far-end resend channels appended after the mic channels (the AEC reference).
+# 0 = send only the captured mic channels. To re-enable the reference channel set
+# this to 1 AND point tcp_receiver.host at the far-end stream; the consumer must
+# be built for the matching channel count (see shim CONSUMER_N_CH).
+n_channel = 0
 
 [audio_connection]
 # connect_mic_speaker = true
