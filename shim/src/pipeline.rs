@@ -204,6 +204,7 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
     tokio::spawn(sink.run(sink_rx));
 
     let packet_ms = cfg.packet_ms_in();
+    let mut gate = EnergyGate::new(packet_ms);
     let mut tick_rx = spawn_pacer(packet_ms);
     let mut est = DepthEstimator::new(cfg.d_max_adaptive_ms, packet_ms);
     let mut jb = JitterBuffer::new(
@@ -217,7 +218,6 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
     );
     let mut ctl = DepthController::new(1.0, cfg.catchup_clamp, cfg.catchup_slew_per_sec);
     let mut refr = Reframer::new(in_layout, out_layout, 0, cfg.sample_rate, FADE_MS);
-    let mut gate = EnergyGate::new();
     let mut m = Metrics::new();
     let max_depth_packets = cfg.max_depth_packets();
 
@@ -251,28 +251,37 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
 
         // Wait for the release tick, but keep stamping arrivals while waiting --
         // parking them in the channel for up to a full packet period would skew
-        // the delay statistic by that much.
+        // the delay statistic by that much. The tick arm comes FIRST under
+        // `biased`: with arrivals-first, a sustained post-stall flood kept the
+        // select on the arrival arm indefinitely and releases stalled for the
+        // whole burst.
         loop {
             tokio::select! {
                 biased;
-                ev = src_rx.recv() => match ev {
-                    Some(ev) => {
-                        timeline_reset_due |= on_event(ev, now_ms(), &mut jb, &mut est, &mut m);
-                    }
-                    None => return,
-                },
                 tick = tick_rx.recv() => {
                     if tick.is_none() {
                         return;
                     }
                     break;
                 }
+                ev = src_rx.recv() => match ev {
+                    Some(ev) => {
+                        timeline_reset_due |= on_event(ev, now_ms(), &mut jb, &mut est, &mut m);
+                    }
+                    None => return,
+                },
             }
         }
         // Take everything else that has arrived without blocking, so the jitter
-        // buffer sees arrivals promptly and in order.
+        // buffer sees arrivals promptly and in order -- bounded, so a flood
+        // cannot postpone the release this tick already earned.
+        let mut drained = 0;
         while let Ok(event) = src_rx.try_recv() {
             timeline_reset_due |= on_event(event, now_ms(), &mut jb, &mut est, &mut m);
+            drained += 1;
+            if drained >= 2048 {
+                break;
+            }
         }
 
         if timeline_reset_due {
@@ -281,6 +290,9 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
             // different clock.
             timeline_reset_due = false;
             refr.reset_timeline();
+            // A proven restart is a possibly different device, gain and room:
+            // the gate's calibration must not cross the generation boundary.
+            gate.reset();
         }
 
         let dropped = jb.enforce_max_depth(max_depth_packets);
@@ -337,7 +349,11 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
                         // honest if they see the whole stream. It arms only
                         // when the buffer is genuinely backed up and drops only
                         // what measures as room tone by both mean and peak.
-                        let depth_ms = jb.buffered() as u64 * packet_ms;
+                        // Pre-release depth: the candidate packet has already
+                        // been taken out of the buffer, so add it back — the
+                        // engage test is about the backlog that produced this
+                        // release, not the residue after it.
+                        let depth_ms = (jb.buffered() as u64 + 1) * packet_ms;
                         if gate.should_elide(&p, &in_layout, now, depth_ms, est.target_ms())
                             && budget > 0
                         {

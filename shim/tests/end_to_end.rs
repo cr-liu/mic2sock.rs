@@ -443,7 +443,7 @@ async fn silence_elision_drains_a_quiet_backlog_fast() {
 
     let mut consumer = connect_retrying(sink_port).await;
     let mut c0 = vec![0i16; l_out.spp];
-    let mut saw_speech = false;
+    let mut speech_packets = 0;
     let mut marker_at = None;
 
     // Without elision the 260 packets of room tone play for 520 ms: the marker
@@ -454,16 +454,23 @@ async fn silence_elision_drains_a_quiet_backlog_fast() {
         let buf = read_one_packet(&mut consumer, l_out.packet_len()).await;
         deblock_channel(&buf, &l_out, 0, &mut c0);
         if c0.iter().any(|&s| s.abs() > 1200 && s.abs() < 2400) {
-            saw_speech = true;
+            speech_packets += 1;
         }
         if c0.iter().any(|&s| s.abs() > 2500) {
             marker_at = Some(i);
             break;
         }
     }
+    // 300 input packets of speech reframe to 60 output packets. Every one of
+    // them must arrive: speech is above the gate's absolute ceilings and can
+    // never classify as quiet, so any shortfall here means elision ate loud
+    // content. (A bare "saw some speech" assertion let the gate delete the
+    // last 50 speech packets invisibly -- review round 6, finding on this
+    // very test.)
     assert!(
-        saw_speech,
-        "the speech ahead of the silence never arrived; elision must not eat loud content"
+        (57..=62).contains(&speech_packets),
+        "expected ~60 output packets of speech, got {}: elision ate loud content",
+        speech_packets
     );
     let at = marker_at.expect("marker never arrived: the quiet backlog was not elided");
     assert!(

@@ -41,11 +41,25 @@ pub const ELIDE_HANGOVER_MS: u64 = 100;
 /// one tick never stalls the loop even against a deep all-silent backlog.
 pub const ELIDE_BUDGET_PER_TICK: usize = 16;
 
-/// Packets observed before the gate trusts its floor estimate. A stream that
-/// begins mid-speech seeds the floor at speech level, and until a quieter
-/// moment recalibrates it the threshold is wrong — so the gate stays closed
-/// for roughly half a second of packets rather than guessing.
-const WARMUP_PACKETS: u64 = 250;
+/// Time observed before the gate trusts its floor estimate, converted to a
+/// packet count from the source packet duration — a raw packet count silently
+/// changed fivefold between 2 ms and legacy 10 ms framing.
+const WARMUP_MS: u64 = 500;
+
+/// Absolute ceilings on what may ever classify as quiet, in i16 amplitude
+/// units. These are what make the relative thresholds safe: a stream that
+/// begins mid-speech seeds the floor at speech level and then satisfies
+/// mean < 2*floor forever — as does DC-offset or clipped content, where
+/// mean == peak == floor. No relative test can catch a floor poisoned by its
+/// own calibration signal, so nothing louder than unambiguous room tone
+/// (-44 dBFS mean, -38 dBFS peak against i16 full scale) is elidable, ever.
+///
+/// The peak ceiling doubles as the splice bound: an elision cut joins two
+/// kept packets without a fade, and the worst-case waveform step is
+/// 2 * ABS_PEAK_CEIL ~= -38 dBFS — at the level of the room tone being
+/// spliced, masked by it, and far below any speech that matters.
+const ABS_MEAN_CEIL: u64 = 100;
+const ABS_PEAK_CEIL: u64 = 200;
 
 /// Quiet requires the loudest channel's MEAN within MEAN_FACTOR x floor and
 /// its PEAK within PEAK_FACTOR x floor (each plus a small absolute offset so
@@ -64,26 +78,31 @@ pub struct EnergyGate {
     /// lift it to speech level.
     floor: u64,
     seen: u64,
+    warmup_packets: u64,
     /// Timestamp of the last packet that measured loud.
     last_loud_ms: u64,
     /// The pressure hysteresis state.
     armed: bool,
 }
 
-impl Default for EnergyGate {
-    fn default() -> Self {
-        EnergyGate::new()
-    }
-}
-
 impl EnergyGate {
-    pub fn new() -> Self {
+    pub fn new(packet_ms: u64) -> Self {
         EnergyGate {
             floor: u64::MAX,
             seen: 0,
+            warmup_packets: (WARMUP_MS / packet_ms.max(1)).max(1),
             last_loud_ms: 0,
             armed: false,
         }
+    }
+
+    /// Forgets everything but the packet duration. A proven sender restart
+    /// means a possibly different device, gain and room: calibration taken
+    /// from the old generation must not judge the new one — the floor of a
+    /// quiet old source could classify a quieter-voiced new speaker as room
+    /// tone from the very first packet.
+    pub fn reset(&mut self) {
+        *self = EnergyGate::new(WARMUP_MS / self.warmup_packets.max(1));
     }
 
     /// Mean-abs of the loudest channel, and the peak-abs across all channels.
@@ -135,7 +154,9 @@ impl EnergyGate {
         }
 
         let quiet = mean < self.floor * MEAN_FACTOR + MEAN_OFFSET
-            && peak < self.floor * PEAK_FACTOR + PEAK_OFFSET;
+            && peak < self.floor * PEAK_FACTOR + PEAK_OFFSET
+            && mean <= ABS_MEAN_CEIL
+            && peak <= ABS_PEAK_CEIL;
         if !quiet {
             self.last_loud_ms = now_ms;
         }
@@ -150,7 +171,7 @@ impl EnergyGate {
 
         self.armed
             && quiet
-            && self.seen >= WARMUP_PACKETS
+            && self.seen >= self.warmup_packets
             && now_ms.saturating_sub(self.last_loud_ms) >= ELIDE_HANGOVER_MS
     }
 }
@@ -162,6 +183,8 @@ mod tests {
     const L: PacketLayout = PacketLayout::new(16, 32, 12);
     /// A depth that keeps the gate armed against the default target.
     const DEEP: u64 = 10_000;
+    /// Warmup length at the 2 ms test packet duration.
+    const WARMUP_N: u64 = WARMUP_MS / 2;
 
     fn packet(amplitude: i16) -> Vec<u8> {
         let mut buf = vec![0u8; L.packet_len()];
@@ -187,9 +210,9 @@ mod tests {
     }
 
     fn warmed_gate(noise: i16) -> (EnergyGate, u64) {
-        let mut g = EnergyGate::new();
+        let mut g = EnergyGate::new(2);
         let mut now = 0;
-        for _ in 0..WARMUP_PACKETS {
+        for _ in 0..WARMUP_N {
             now += 2;
             g.should_elide(&packet(noise), &L, now, DEEP, 80);
         }
@@ -198,7 +221,7 @@ mod tests {
 
     #[test]
     fn quiet_elides_only_after_warmup_and_hangover() {
-        let mut g = EnergyGate::new();
+        let mut g = EnergyGate::new(2);
         // Before warmup nothing may be elided, however quiet and however deep.
         assert!(!g.should_elide(&packet(0), &L, 2, DEEP, 80));
 
@@ -279,6 +302,77 @@ mod tests {
         assert!(
             g.should_elide(&packet(2), &L, now, DEEP, 80),
             "floor rose to speech level during a 5 s utterance"
+        );
+    }
+    /// A stream that begins mid-speech seeds the floor at speech level, and
+    /// every relative test then classifies the speech as quiet forever — only
+    /// the absolute ceilings stand between that poisoned floor and deletion.
+    /// DC-offset and clipped content are the same failure (mean == peak ==
+    /// floor) and must never be quiet either.
+    #[test]
+    fn a_poisoned_floor_cannot_elide_speech() {
+        // Cold start straight into constant speech, deep backlog, forever.
+        let mut g = EnergyGate::new(2);
+        let mut now = 0;
+        for _ in 0..(WARMUP_N * 4) {
+            now += 2;
+            assert!(
+                !g.should_elide(&packet(2000), &L, now, DEEP, 80),
+                "mid-speech calibration elided speech at t={}",
+                now
+            );
+        }
+        // Clipped/DC content: as loud as it gets, mean == peak == floor.
+        let mut g = EnergyGate::new(2);
+        let mut now = 0;
+        for _ in 0..(WARMUP_N * 4) {
+            now += 2;
+            assert!(
+                !g.should_elide(&packet(30000), &L, now, DEEP, 80),
+                "clipped/DC content elided at t={}",
+                now
+            );
+        }
+    }
+
+    /// The warmup is a duration, not a packet count: at 10 ms legacy packets
+    /// it must complete in the same half second (50 packets), not 2.5 s.
+    #[test]
+    fn warmup_scales_with_packet_duration() {
+        let l10 = PacketLayout::new(16, 160, 12);
+        let mut buf = vec![0u8; l10.packet_len()];
+        for ch in 0..l10.n_ch {
+            let base = l10.header_len + ch * l10.spp * 2;
+            for s in 0..l10.spp {
+                buf[base + s * 2..base + s * 2 + 2].copy_from_slice(&2i16.to_le_bytes());
+            }
+        }
+        let mut g = EnergyGate::new(10);
+        let mut now = 0;
+        for _ in 0..(WARMUP_MS / 10) {
+            now += 10;
+            g.should_elide(&buf, &l10, now, DEEP, 80);
+        }
+        now += ELIDE_HANGOVER_MS + 10;
+        assert!(
+            g.should_elide(&buf, &l10, now, DEEP, 80),
+            "50 x 10 ms packets are half a second; warmup must be over"
+        );
+    }
+
+    /// A proven sender restart resets the gate: old-generation calibration
+    /// must not judge the new speaker, and the warmup starts over.
+    #[test]
+    fn reset_forgets_the_old_generation() {
+        let (mut g, mut now) = warmed_gate(2);
+        now += ELIDE_HANGOVER_MS + 2;
+        assert!(g.should_elide(&packet(2), &L, now, DEEP, 80));
+
+        g.reset();
+        now += 2;
+        assert!(
+            !g.should_elide(&packet(2), &L, now, DEEP, 80),
+            "a reset gate must re-warm before eliding anything"
         );
     }
 }
