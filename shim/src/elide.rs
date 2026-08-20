@@ -96,6 +96,11 @@ pub struct EnergyGate {
     /// this stream's loud content rides above it, i.e. the floor is honest.
     loud_seen: u64,
     contrast_packets: u64,
+    /// Lowest floor seen since (re)calibration. A floor that has risen far
+    /// above it is tracking content, not noise -- speech whose gain dropped
+    /// until it hugs its own level -- and the calibration is no longer
+    /// trustworthy: the gate closes rather than guess. (Round 9, High.)
+    min_floor: u64,
     /// Timestamp of the last packet that measured loud.
     last_loud_ms: u64,
     /// The pressure hysteresis state.
@@ -110,6 +115,7 @@ impl EnergyGate {
             warmup_packets: (WARMUP_MS / packet_ms.max(1)).max(1),
             loud_seen: 0,
             contrast_packets: (CONTRAST_MIN_MS / packet_ms.max(1)).max(1),
+            min_floor: u64::MAX,
             last_loud_ms: 0,
             armed: false,
         }
@@ -172,6 +178,11 @@ impl EnergyGate {
             self.floor += ((mean - self.floor) / 16_384).max(1).min(mean - self.floor);
         }
 
+        self.min_floor = self.min_floor.min(self.floor);
+        // Real ambient drift is gentle; a floor several times above the
+        // quietest level ever measured means the "floor" has climbed onto
+        // content, and nothing may be elided against it.
+        let floor_trusted = self.floor <= self.min_floor.saturating_mul(4) + MEAN_OFFSET;
         let quiet = mean < self.floor * MEAN_FACTOR + MEAN_OFFSET
             && peak < self.floor * PEAK_FACTOR + PEAK_OFFSET
             && mean <= ABS_MEAN_CEIL
@@ -199,6 +210,7 @@ impl EnergyGate {
 
         self.armed
             && quiet
+            && floor_trusted
             && self.seen >= self.warmup_packets
             && self.loud_seen >= self.contrast_packets
             && now_ms.saturating_sub(self.last_loud_ms) >= ELIDE_HANGOVER_MS
@@ -523,6 +535,33 @@ mod tests {
             assert!(
                 !g.should_elide(&buf, &L, now, DEEP, 80),
                 "stale near-floor contrast authorised elision at t={}",
+                now
+            );
+        }
+    }
+    /// Genuine contrast earned early must not authorise deletion after a gain
+    /// drop leaves speech hugging a risen floor: floor 1 -> 80 is an 80x
+    /// climb, which no ambient drift produces. (Review round 9, High.)
+    #[test]
+    fn contrast_expires_when_the_floor_climbs_onto_content() {
+        let mut g = EnergyGate::new(2);
+        let mut now = 0;
+        for _ in 0..50 {
+            now += 2;
+            g.should_elide(&packet(1), &L, now, DEEP, 80);
+        }
+        for _ in 0..50 {
+            now += 2;
+            g.should_elide(&packet(30000), &L, now, DEEP, 80);
+        }
+        for _ in 0..2000 {
+            now += 2;
+            let mut buf = packet(80);
+            let base = L.header_len;
+            buf[base..base + 2].copy_from_slice(&160i16.to_le_bytes());
+            assert!(
+                !g.should_elide(&buf, &L, now, DEEP, 80),
+                "gain-dropped speech elided at t={}",
                 now
             );
         }
