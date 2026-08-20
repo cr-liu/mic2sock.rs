@@ -19,7 +19,7 @@
 
 use crate::config::Config;
 use crate::depth::{Arrival, DepthEstimator};
-use crate::elide::{EnergyGate, ELIDE_BUDGET_PER_TICK, ELIDE_MARGIN_MS};
+use crate::elide::{EnergyGate, ELIDE_BUDGET_PER_TICK};
 use crate::jitter::{JitterBuffer, Released, State as JitterState};
 use crate::metrics::Metrics;
 use crate::reframe::Reframer;
@@ -333,12 +333,14 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
                 Released::Real(p) => {
                     if cfg.silence_elision {
                         // The gate observes every real release, elided or not:
-                        // its noise floor and hangover only stay honest if they
-                        // see the whole stream.
-                        let quiet = gate.may_elide(&p, &in_layout, now);
-                        let over_target = (jb.buffered() as u64 * packet_ms)
-                            > est.target_ms() + ELIDE_MARGIN_MS;
-                        if quiet && over_target && budget > 0 {
+                        // its floor, hangover and pressure hysteresis only stay
+                        // honest if they see the whole stream. It arms only
+                        // when the buffer is genuinely backed up and drops only
+                        // what measures as room tone by both mean and peak.
+                        let depth_ms = jb.buffered() as u64 * packet_ms;
+                        if gate.should_elide(&p, &in_layout, now, depth_ms, est.target_ms())
+                            && budget > 0
+                        {
                             m.silence_elided += 1;
                             continue;
                         }

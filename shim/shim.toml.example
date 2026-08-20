@@ -70,12 +70,15 @@ outage_threshold_ms = 200
 # idle. Only `true` is implemented.
 keep_source_when_idle = true
 
-# Drop released source packets that measure as room tone while the buffer sits
-# above target depth + 40 ms, draining a backlog at up to 16x real time instead
-# of the resampler's 2.5%. Only near-silence is lost; speech is kept whole with
-# a 50 ms hangover, and nothing is elided at normal depth. The silence_elided
-# counter in the metrics is the audit trail. MUST be turned off if an AEC
-# reference channel ever returns: elision warps the timeline non-uniformly.
+# Drop released source packets that measure as room tone, but ONLY while the
+# buffer is genuinely backed up: the gate arms above target depth + 500 ms and
+# disarms once the drain reaches target + 100 ms (hysteresis, so ordinary
+# jitter never triggers it). Quiet requires both the packet mean AND peak to
+# sit near the measured noise floor -- a lone consonant keeps its packet --
+# plus a 100 ms hangover after anything loud. Drains at up to 16x real time.
+# The silence_elided counter in the metrics is the audit trail. MUST be turned
+# off if an AEC reference channel ever returns: elision warps the timeline
+# non-uniformly.
 silence_elision = true
 
 # Append one JSON object per minute here. This is the instrument for answering "how
