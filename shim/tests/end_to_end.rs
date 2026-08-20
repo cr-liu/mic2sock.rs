@@ -415,8 +415,13 @@ async fn silence_elision_drains_a_quiet_backlog_fast() {
         // release rate (no backlog ever formed and the test measured nothing).
         let mut burst = Vec::new();
         for id in 0..600 {
-            // 0..300 speech, 300..560 room tone, 560..600 a louder marker.
-            let amp = if id < 300 {
+            // 0..50 room tone (the floor must calibrate on quiet before the
+            // contrast rule lets anything count as loud -- a speech-first
+            // stream is the mid-speech cold start the gate refuses, by
+            // design), 50..350 speech, 350..560 room tone, 560..600 a marker.
+            let amp = if id < 50 {
+                2
+            } else if id < 350 {
                 2000
             } else if id < 560 {
                 0
@@ -450,7 +455,7 @@ async fn silence_elision_drains_a_quiet_backlog_fast() {
     // arrives around output packet 112 at the earliest. With elision draining
     // at up to 16x real time it must arrive far sooner. The bound is loose
     // enough to be scheduling-proof but firmly below the no-elision floor.
-    for i in 0..110 {
+    for i in 0..112 {
         let buf = read_one_packet(&mut consumer, l_out.packet_len()).await;
         deblock_channel(&buf, &l_out, 0, &mut c0);
         if c0.iter().any(|&s| s.abs() > 1200 && s.abs() < 2400) {
@@ -473,8 +478,11 @@ async fn silence_elision_drains_a_quiet_backlog_fast() {
         speech_packets
     );
     let at = marker_at.expect("marker never arrived: the quiet backlog was not elided");
+    // Without elision the marker cannot arrive before output packet 112
+    // (560 input packets at 1x). The bound sits below that floor with room
+    // for the hangover and the disarm tail.
     assert!(
-        at < 95,
+        at < 104,
         "marker arrived at output packet {} -- no faster than real time; elision inert",
         at
     );

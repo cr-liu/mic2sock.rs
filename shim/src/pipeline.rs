@@ -296,8 +296,12 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
             timeline_reset_due = false;
             refr.reset_timeline();
             // A proven restart is a possibly different device, gain and room:
-            // the gate's calibration must not cross the generation boundary.
+            // the gate's calibration must not cross the generation boundary --
+            // and neither may the splice state, or the new source's first
+            // packet gets ramped from the old source's final samples.
             gate.reset();
+            last_tail = None;
+            elided_since_push = false;
         }
 
         let dropped = jb.enforce_max_depth(max_depth_packets);

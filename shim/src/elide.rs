@@ -70,6 +70,9 @@ const ABS_PEAK_CEIL: u64 = 200;
 /// so the gate simply never opens on such a stream. A genuinely silent
 /// stream also never elides -- conservative, and elision is an optimisation.
 const CONTRAST_MIN_MS: u64 = 100;
+/// A contrast packet must exceed CONTRAST_FACTOR x the floor it was measured
+/// against (as well as the absolute ceiling).
+const CONTRAST_FACTOR: u64 = 8;
 
 /// Quiet requires the loudest channel's MEAN within MEAN_FACTOR x floor and
 /// its PEAK within PEAK_FACTOR x floor (each plus a small absolute offset so
@@ -176,7 +179,13 @@ impl EnergyGate {
         if !quiet {
             self.last_loud_ms = now_ms;
         }
-        if mean > ABS_MEAN_CEIL {
+        // Contrast must clear the floor by a wide factor, not merely the
+        // ceiling: content at mean 101 over a floor of 101 is not evidence of
+        // dynamic range, and counting it let historical near-floor 'loudness'
+        // authorise eliding low-gain speech after a later gain change. A
+        // packet only counts if it towers over the floor it was measured
+        // against; a floor that falls later only makes old evidence stricter.
+        if mean > ABS_MEAN_CEIL.max(self.floor * CONTRAST_FACTOR) {
             self.loud_seen += 1;
         }
 
@@ -493,6 +502,29 @@ mod tests {
                 );
                 prev = v;
             }
+        }
+    }
+    /// Historical near-floor "loudness" is not contrast: 200 packets at mean
+    /// 101 over a floor of 101 must not authorise eliding low-gain speech
+    /// after a later gain drop. (Review round 8, High.)
+    #[test]
+    fn near_floor_loudness_is_not_contrast() {
+        let mut g = EnergyGate::new(2);
+        let mut now = 0;
+        for _ in 0..200 {
+            now += 2;
+            g.should_elide(&packet(101), &L, now, DEEP, 80);
+        }
+        for _ in 0..(WARMUP_N * 4) {
+            now += 2;
+            let mut buf = packet(80);
+            let base = L.header_len;
+            buf[base..base + 2].copy_from_slice(&160i16.to_le_bytes());
+            assert!(
+                !g.should_elide(&buf, &L, now, DEEP, 80),
+                "stale near-floor contrast authorised elision at t={}",
+                now
+            );
         }
     }
 }
