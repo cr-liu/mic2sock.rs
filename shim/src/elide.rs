@@ -201,13 +201,15 @@ impl EnergyGate {
         // ever measured -- statistically the stream's own ambient. What
         // satisfies that is, by construction, not above the room tone it is
         // spliced into; anything audible over ambient cannot qualify.
-        // The anchor: the stream's true minimum, except that a freak outlier
-        // (one digital-zero packet in a mean-10 room) must not disable
-        // elision for the whole generation -- floor/2 provides the recovery
-        // path, because the floor rises only by its honest time constant on
-        // *sustained* levels and fast-falls at any pause, so speech cannot
-        // hold it up, while genuine ambient restores it within minutes.
-        let anchor = (self.min_floor_milli / 1024).max(floor / 2);
+        // The anchor is the true minimum, full stop. Every recovery escape
+        // hatch tried against it (slow-rising min, floor/2) was defeated by
+        // placing sustained content just inside the reopened band (rounds 12
+        // and 13): any relative concession re-admits content above ambient.
+        // The cost of no escape hatch is that a freak quieter-than-ambient
+        // outlier tightens the anchor for the rest of the generation --
+        // elision quietly under-fires. That direction is safe by design:
+        // elision is a drain optimisation, and it fails toward keeping audio.
+        let anchor = self.min_floor_milli / 1024;
         let quiet = mean <= anchor + MEAN_OFFSET
             && mean < floor * MEAN_FACTOR + MEAN_OFFSET
             && peak < floor * PEAK_FACTOR + PEAK_OFFSET
