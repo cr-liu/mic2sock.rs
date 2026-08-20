@@ -198,10 +198,16 @@ impl EnergyGate {
                 .min(self.floor_milli);
         }
         let floor = self.floor_milli / 1024;
-        let floor_trusted =
-            self.floor_milli <= self.min_floor_milli.saturating_mul(2) + MEAN_OFFSET * 1024;
-
-        let quiet = mean < floor * MEAN_FACTOR + MEAN_OFFSET
+        // Quiet is anchored to min_floor, not the tracking floor: rounds 9-11
+        // showed that any band relative to a floor that can move admits
+        // "speech" placed inside the band. Content is elidable only when its
+        // mean sits within MEAN_OFFSET of the quietest level this stream has
+        // ever measured -- statistically the stream's own ambient. What
+        // satisfies that is, by construction, not above the room tone it is
+        // spliced into; anything audible over ambient cannot qualify.
+        let min_floor = self.min_floor_milli / 1024;
+        let quiet = mean <= min_floor + MEAN_OFFSET
+            && mean < floor * MEAN_FACTOR + MEAN_OFFSET
             && peak < floor * PEAK_FACTOR + PEAK_OFFSET
             && mean <= ABS_MEAN_CEIL
             && peak <= ABS_PEAK_CEIL;
@@ -228,7 +234,6 @@ impl EnergyGate {
 
         self.armed
             && quiet
-            && floor_trusted
             && self.seen >= self.warmup_packets
             && self.loud_seen >= self.contrast_packets
             && now_ms.saturating_sub(self.last_loud_ms) >= ELIDE_HANGOVER_MS
