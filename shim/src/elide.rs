@@ -89,18 +89,28 @@ pub struct EnergyGate {
     /// Noise-floor estimate in mean-abs units: falls instantly to any quieter
     /// packet, rises with a ~30 s time constant so a stretch of speech cannot
     /// lift it to speech level.
-    floor: u64,
+    /// In 1/1024ths of an amplitude unit, so the slow rise is real: an
+    /// integer floor needed a minimum step of one whole unit per packet,
+    /// which climbs 500 units/s at 2 ms packets -- onto any sustained
+    /// content within seconds, making the "30 s time constant" fiction and
+    /// every trust heuristic bolted onto it (round 9, round 10) necessary.
+    /// With fractional accumulation the floor genuinely cannot reach
+    /// sustained speech inside tens of minutes, and any pause refloors it
+    /// instantly via the fast fall.
+    floor_milli: u64,
+    /// Slow-rising record of the quietest level measured, same fixed-point
+    /// time constant. The elide decision trusts the floor only within 2x of
+    /// it: a floor that fast-fell onto dropped-gain speech sits far above
+    /// the genuine quiet this stream has shown (rounds 9-10), while a single
+    /// digital-zero outlier only suppresses elision for the seconds the
+    /// recovery takes, not forever (round-10 Medium).
+    min_floor_milli: u64,
     seen: u64,
     warmup_packets: u64,
     /// Packets seen whose mean exceeded the absolute ceiling -- evidence that
     /// this stream's loud content rides above it, i.e. the floor is honest.
     loud_seen: u64,
     contrast_packets: u64,
-    /// Lowest floor seen since (re)calibration. A floor that has risen far
-    /// above it is tracking content, not noise -- speech whose gain dropped
-    /// until it hugs its own level -- and the calibration is no longer
-    /// trustworthy: the gate closes rather than guess. (Round 9, High.)
-    min_floor: u64,
     /// Timestamp of the last packet that measured loud.
     last_loud_ms: u64,
     /// The pressure hysteresis state.
@@ -110,12 +120,12 @@ pub struct EnergyGate {
 impl EnergyGate {
     pub fn new(packet_ms: u64) -> Self {
         EnergyGate {
-            floor: u64::MAX,
+            floor_milli: u64::MAX,
+            min_floor_milli: u64::MAX,
             seen: 0,
             warmup_packets: (WARMUP_MS / packet_ms.max(1)).max(1),
             loud_seen: 0,
             contrast_packets: (CONTRAST_MIN_MS / packet_ms.max(1)).max(1),
-            min_floor: u64::MAX,
             last_loud_ms: 0,
             armed: false,
         }
@@ -167,24 +177,32 @@ impl EnergyGate {
         let (mean, peak) = Self::energy(payload, l);
         self.seen += 1;
 
-        if mean < self.floor {
-            self.floor = mean;
+        let mean_milli = mean.saturating_mul(1024);
+        if mean_milli < self.floor_milli {
+            self.floor_milli = mean_milli;
         } else {
-            // Slow rise: at 500 packets/s this is a ~30 s time constant, so
-            // the floor tracks a drifting noise level (fans, motors) without
-            // following speech up.
-            // max-then-min, not clamp: when mean == floor the bounds invert
-            // (1 > 0) and clamp panics on exactly the most common packet.
-            self.floor += ((mean - self.floor) / 16_384).max(1).min(mean - self.floor);
+            // Fractional accumulation keeps the rise at its stated time
+            // constant even when the delta is small; saturating guards the
+            // u64::MAX seed.
+            self.floor_milli = self
+                .floor_milli
+                .saturating_add(((mean_milli - self.floor_milli) / 16_384).max(1))
+                .min(mean_milli);
         }
+        if self.floor_milli < self.min_floor_milli {
+            self.min_floor_milli = self.floor_milli;
+        } else {
+            self.min_floor_milli = self
+                .min_floor_milli
+                .saturating_add(((self.floor_milli - self.min_floor_milli) / 16_384).max(1))
+                .min(self.floor_milli);
+        }
+        let floor = self.floor_milli / 1024;
+        let floor_trusted =
+            self.floor_milli <= self.min_floor_milli.saturating_mul(2) + MEAN_OFFSET * 1024;
 
-        self.min_floor = self.min_floor.min(self.floor);
-        // Real ambient drift is gentle; a floor several times above the
-        // quietest level ever measured means the "floor" has climbed onto
-        // content, and nothing may be elided against it.
-        let floor_trusted = self.floor <= self.min_floor.saturating_mul(4) + MEAN_OFFSET;
-        let quiet = mean < self.floor * MEAN_FACTOR + MEAN_OFFSET
-            && peak < self.floor * PEAK_FACTOR + PEAK_OFFSET
+        let quiet = mean < floor * MEAN_FACTOR + MEAN_OFFSET
+            && peak < floor * PEAK_FACTOR + PEAK_OFFSET
             && mean <= ABS_MEAN_CEIL
             && peak <= ABS_PEAK_CEIL;
         if !quiet {
@@ -196,7 +214,7 @@ impl EnergyGate {
         // authorise eliding low-gain speech after a later gain change. A
         // packet only counts if it towers over the floor it was measured
         // against; a floor that falls later only makes old evidence stricter.
-        if mean > ABS_MEAN_CEIL.max(self.floor * CONTRAST_FACTOR) {
+        if mean > ABS_MEAN_CEIL.max(floor * CONTRAST_FACTOR) {
             self.loud_seen += 1;
         }
 
