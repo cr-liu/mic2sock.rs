@@ -205,6 +205,11 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
 
     let packet_ms = cfg.packet_ms_in();
     let mut gate = EnergyGate::new(packet_ms);
+    // Splice continuity: the final samples of the last pushed real packet, and
+    // whether any packet was elided since. Cleared on non-real releases -- the
+    // reframer's own fades govern those transitions.
+    let mut last_tail: Option<Vec<i16>> = None;
+    let mut elided_since_push = false;
     let mut tick_rx = spawn_pacer(packet_ms);
     let mut est = DepthEstimator::new(cfg.d_max_adaptive_ms, packet_ms);
     let mut jb = JitterBuffer::new(
@@ -358,9 +363,27 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
                             && budget > 0
                         {
                             m.silence_elided += 1;
+                            elided_since_push = true;
                             continue;
                         }
                     }
+                    // An elision cut joins two packets that were never
+                    // adjacent; ramp this packet's first millisecond from the
+                    // previous packet's final samples so the joint carries no
+                    // step at all (a step repeating at the packet rate during
+                    // a sustained drain is a click train, not masked noise).
+                    if elided_since_push {
+                        if let Some(tail) = &last_tail {
+                            let mut spliced = p.to_vec();
+                            EnergyGate::splice_ramp(&mut spliced, &in_layout, tail);
+                            last_tail = Some(EnergyGate::tail_samples(&spliced, &in_layout));
+                            elided_since_push = false;
+                            refr.push_audible(&spliced);
+                            break;
+                        }
+                    }
+                    elided_since_push = false;
+                    last_tail = Some(EnergyGate::tail_samples(&p, &in_layout));
                     refr.push_audible(&p);
                 }
                 Released::Repeat(p) => {
@@ -370,9 +393,13 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
                     // Not `push_packet`: the audio is a repeat, so its header names a time
                     // that has already been emitted and must not anchor the timeline.
                     refr.push_repeat(&p);
+                    last_tail = None;
+                    elided_since_push = false;
                 }
                 Released::Silence => {
                     m.silence_packets += 1;
+                    last_tail = None;
+                    elided_since_push = false;
                     refr.push_silence()
                 }
                 Released::Nothing => {}

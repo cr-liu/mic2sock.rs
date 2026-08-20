@@ -61,6 +61,16 @@ const WARMUP_MS: u64 = 500;
 const ABS_MEAN_CEIL: u64 = 100;
 const ABS_PEAK_CEIL: u64 = 200;
 
+/// Time of unambiguously loud content (mean above the ceiling) that must have
+/// been observed since (re)calibration before anything may be elided. The
+/// ceilings bound amplitude but cannot tell low-gain speech from room tone:
+/// a stream whose speech never rises above the ceiling seeds the floor AT
+/// speech level and every relative test passes forever. Demanding observed
+/// contrast closes that: a poisoned floor implies no contrast was ever seen,
+/// so the gate simply never opens on such a stream. A genuinely silent
+/// stream also never elides -- conservative, and elision is an optimisation.
+const CONTRAST_MIN_MS: u64 = 100;
+
 /// Quiet requires the loudest channel's MEAN within MEAN_FACTOR x floor and
 /// its PEAK within PEAK_FACTOR x floor (each plus a small absolute offset so
 /// a digital-zero floor does not make the thresholds zero). The mean factor
@@ -79,6 +89,10 @@ pub struct EnergyGate {
     floor: u64,
     seen: u64,
     warmup_packets: u64,
+    /// Packets seen whose mean exceeded the absolute ceiling -- evidence that
+    /// this stream's loud content rides above it, i.e. the floor is honest.
+    loud_seen: u64,
+    contrast_packets: u64,
     /// Timestamp of the last packet that measured loud.
     last_loud_ms: u64,
     /// The pressure hysteresis state.
@@ -91,6 +105,8 @@ impl EnergyGate {
             floor: u64::MAX,
             seen: 0,
             warmup_packets: (WARMUP_MS / packet_ms.max(1)).max(1),
+            loud_seen: 0,
+            contrast_packets: (CONTRAST_MIN_MS / packet_ms.max(1)).max(1),
             last_loud_ms: 0,
             armed: false,
         }
@@ -160,6 +176,9 @@ impl EnergyGate {
         if !quiet {
             self.last_loud_ms = now_ms;
         }
+        if mean > ABS_MEAN_CEIL {
+            self.loud_seen += 1;
+        }
 
         // Pressure hysteresis: arm on a genuine backlog, disarm once the
         // drain has brought depth back near the target.
@@ -172,7 +191,39 @@ impl EnergyGate {
         self.armed
             && quiet
             && self.seen >= self.warmup_packets
+            && self.loud_seen >= self.contrast_packets
             && now_ms.saturating_sub(self.last_loud_ms) >= ELIDE_HANGOVER_MS
+    }
+
+    /// Rewrites the first ~1 ms of `payload` so each channel ramps linearly
+    /// from `last_tail` (the final sample of the previously pushed packet)
+    /// into this packet's own waveform. An elision cut joins two packets that
+    /// were never adjacent; without this the joint is a step, and steps
+    /// repeating at the packet rate during a sustained drain form a click
+    /// train. With it the joint is exact: no discontinuity survives at all.
+    pub fn splice_ramp(payload: &mut [u8], l: &PacketLayout, last_tail: &[i16]) {
+        let ramp = l.spp.min(16);
+        for (ch, &from) in last_tail.iter().enumerate().take(l.n_ch) {
+            let base = l.header_len + ch * l.spp * 2;
+            let idx = |s: usize| base + s * 2;
+            let target =
+                i16::from_le_bytes([payload[idx(ramp - 1)], payload[idx(ramp - 1) + 1]]) as i64;
+            let from = from as i64;
+            for s in 0..ramp.saturating_sub(1) {
+                let v = from + (target - from) * (s as i64 + 1) / ramp as i64;
+                payload[idx(s)..idx(s) + 2].copy_from_slice(&(v as i16).to_le_bytes());
+            }
+        }
+    }
+
+    /// The final sample of each channel, for splice continuity tracking.
+    pub fn tail_samples(payload: &[u8], l: &PacketLayout) -> Vec<i16> {
+        (0..l.n_ch)
+            .map(|ch| {
+                let i = l.header_len + ch * l.spp * 2 + (l.spp - 1) * 2;
+                i16::from_le_bytes([payload[i], payload[i + 1]])
+            })
+            .collect()
     }
 }
 
@@ -209,12 +260,18 @@ mod tests {
         assert_eq!(EnergyGate::energy(&buf, &L), (3000, 3000));
     }
 
+    /// Warms the floor on `noise` and supplies contrast (a stretch of loud
+    /// packets): a gate that has never seen unambiguous loudness never opens.
     fn warmed_gate(noise: i16) -> (EnergyGate, u64) {
         let mut g = EnergyGate::new(2);
         let mut now = 0;
         for _ in 0..WARMUP_N {
             now += 2;
             g.should_elide(&packet(noise), &L, now, DEEP, 80);
+        }
+        for _ in 0..(CONTRAST_MIN_MS / 2) {
+            now += 2;
+            g.should_elide(&packet(2000), &L, now, DEEP, 80);
         }
         (g, now)
     }
@@ -347,11 +404,23 @@ mod tests {
                 buf[base + s * 2..base + s * 2 + 2].copy_from_slice(&2i16.to_le_bytes());
             }
         }
+        let mut loud = vec![0u8; l10.packet_len()];
+        for ch in 0..l10.n_ch {
+            let base = l10.header_len + ch * l10.spp * 2;
+            for s in 0..l10.spp {
+                loud[base + s * 2..base + s * 2 + 2].copy_from_slice(&2000i16.to_le_bytes());
+            }
+        }
         let mut g = EnergyGate::new(10);
         let mut now = 0;
         for _ in 0..(WARMUP_MS / 10) {
             now += 10;
             g.should_elide(&buf, &l10, now, DEEP, 80);
+        }
+        // Contrast at this duration too: 100 ms is ten 10 ms packets.
+        for _ in 0..(CONTRAST_MIN_MS / 10) {
+            now += 10;
+            g.should_elide(&loud, &l10, now, DEEP, 80);
         }
         now += ELIDE_HANGOVER_MS + 10;
         assert!(
@@ -374,5 +443,56 @@ mod tests {
             !g.should_elide(&packet(2), &L, now, DEEP, 80),
             "a reset gate must re-warm before eliding anything"
         );
+    }
+    /// Low-gain speech that never rises above the absolute ceiling seeds the
+    /// floor at its own level and passes every relative and absolute test --
+    /// the contrast requirement is what keeps it: no packet above the ceiling
+    /// means no evidence the floor is honest, so the gate never opens.
+    /// (Review round 7, High: mean 80 / peak 160 speech was deletable.)
+    #[test]
+    fn low_gain_speech_inside_the_ceilings_is_never_elided() {
+        let mut g = EnergyGate::new(2);
+        let mut now = 0;
+        for _ in 0..(WARMUP_N * 8) {
+            now += 2;
+            let mut buf = packet(80);
+            // peak 160 on one sample, mean stays ~82: inside both ceilings.
+            let base = L.header_len;
+            buf[base..base + 2].copy_from_slice(&160i16.to_le_bytes());
+            assert!(
+                !g.should_elide(&buf, &L, now, DEEP, 80),
+                "low-gain speech elided at t={}",
+                now
+            );
+        }
+    }
+
+    /// The splice ramp erases the joint: whatever the previous packet ended
+    /// at, the rewritten first millisecond steps by less than the old jump.
+    #[test]
+    fn splice_ramp_bounds_the_joint_step() {
+        let mut buf = packet(-200);
+        let tail = vec![200i16; L.n_ch];
+        EnergyGate::splice_ramp(&mut buf, &L, &tail);
+        for ch in 0..L.n_ch {
+            let base = L.header_len + ch * L.spp * 2;
+            let s0 = i16::from_le_bytes([buf[base], buf[base + 1]]) as i32;
+            assert!(
+                (s0 - 200).abs() <= 400 / 16 + 1,
+                "first sample after splice jumped {} from the previous tail",
+                (s0 - 200).abs()
+            );
+            let mut prev = 200i32;
+            for s in 0..16 {
+                let i = base + s * 2;
+                let v = i16::from_le_bytes([buf[i], buf[i + 1]]) as i32;
+                assert!(
+                    (v - prev).abs() <= 400 / 16 + 1,
+                    "step {} inside ramp",
+                    (v - prev).abs()
+                );
+                prev = v;
+            }
+        }
     }
 }
