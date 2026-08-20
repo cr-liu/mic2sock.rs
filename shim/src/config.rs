@@ -32,6 +32,12 @@ pub struct Config {
     pub n_ch: usize,
     #[serde(default = "default_spp_out")]
     pub spp_out: usize,
+    /// Samples per packet on the SOURCE side. Our side of the wire, so unlike the
+    /// consumer geometry above it is a free choice; the reframer accumulates
+    /// whatever arrives into `spp_out`-sample output packets. Unset means the
+    /// source still sends consumer-sized packets (the legacy layout).
+    #[serde(default)]
+    pub spp_in: Option<usize>,
     #[serde(default = "default_header_len")]
     pub header_len: usize,
     #[serde(default = "default_sample_rate")]
@@ -208,9 +214,29 @@ impl Config {
             }
         }
 
+        // The source packet size is our choice, but not an unbounded one: the
+        // depth/jitter arithmetic is integer milliseconds, so a source packet
+        // must last a whole number of them; and larger than the output packet
+        // would mean the reframer holds audio back to split it, adding latency
+        // for nothing.
+        if let Some(spp_in) = self.spp_in {
+            if spp_in == 0 || spp_in > self.spp_out {
+                return Err(format!(
+                    "spp_in must be in 1..={} (got {})",
+                    self.spp_out, spp_in
+                ));
+            }
+            if (spp_in * 1000) % self.sample_rate != 0 {
+                return Err(format!(
+                    "spp_in = {} does not last a whole number of milliseconds at {} Hz;                      the depth accounting is integer-ms and would silently round",
+                    spp_in, self.sample_rate
+                ));
+            }
+        }
+
         // Depth chain: target <= retained <= safety valve. Out of order, the
         // stage below discards what the stage above is waiting for.
-        let packet_ms = self.packet_ms();
+        let packet_ms = self.packet_ms_in();
         if !(2 * packet_ms..=MAX_D_MAX_ADAPTIVE_MS).contains(&self.d_max_adaptive_ms) {
             return Err(format!(
                 "d_max_adaptive_ms must be in {}..={} (got {}): two packets is the structural \
@@ -276,6 +302,23 @@ impl Config {
         PacketLayout::new(self.n_ch, self.spp_out, self.header_len)
     }
 
+    pub fn spp_in(&self) -> usize {
+        self.spp_in.unwrap_or(self.spp_out)
+    }
+
+    /// The layout of packets ARRIVING from the source. The jitter buffer, the
+    /// depth estimator and every packet-count derivation below operate on these,
+    /// not on the consumer-sized output packets.
+    pub fn in_layout(&self) -> PacketLayout {
+        PacketLayout::new(self.n_ch, self.spp_in(), self.header_len)
+    }
+
+    /// Duration of one SOURCE packet in ms — the granularity of the jitter
+    /// buffer and the release pacer.
+    pub fn packet_ms_in(&self) -> u64 {
+        (self.spp_in() * 1000 / self.sample_rate) as u64
+    }
+
     /// Wall duration of one output packet, in milliseconds. Exact and non-zero:
     /// `validate` pins the geometry to 160 samples at 16 kHz.
     pub fn packet_ms(&self) -> u64 {
@@ -288,7 +331,7 @@ impl Config {
     /// `max_depth_ms` dominates the chain and `packet_ms` is at least 1, so none
     /// of these conversions can narrow on a 32-bit build.
     pub fn catchup_max_packets(&self) -> usize {
-        (self.catchup_max_ms / self.packet_ms()) as usize
+        (self.catchup_max_ms / self.packet_ms_in()) as usize
     }
 
     /// Ceiling on what the resync anchor may retain, in packets.
@@ -299,12 +342,12 @@ impl Config {
     /// jitter buffer's `retain_cap` (a hard latency bound, so a fixed ceiling is
     /// the right shape); trimming to the live target is the pipeline's job.
     pub fn retain_cap_packets(&self) -> usize {
-        ((self.d_max_adaptive_ms + self.catchup_max_ms) / self.packet_ms()) as usize
+        ((self.d_max_adaptive_ms + self.catchup_max_ms) / self.packet_ms_in()) as usize
     }
 
     /// Safety-valve depth in packets. Never below `retain_cap_packets()`.
     pub fn max_depth_packets(&self) -> usize {
-        (self.max_depth_ms / self.packet_ms()) as usize
+        (self.max_depth_ms / self.packet_ms_in()) as usize
     }
 }
 
@@ -338,6 +381,34 @@ source_port = 7998
 
     fn with(extra: &str) -> Result<Config, String> {
         parse(&format!("{}{}\n", MINIMAL, extra))
+    }
+
+    /// The source packet size is our side of the wire and a free choice within
+    /// bounds; the consumer geometry stays pinned regardless. Unset means the
+    /// legacy layout where the source sends consumer-sized packets.
+    #[test]
+    fn source_packet_size_is_free_within_bounds() {
+        let c = with("spp_in = 32").unwrap();
+        assert_eq!(c.spp_in(), 32);
+        assert_eq!(c.packet_ms_in(), 2);
+        assert_eq!(c.in_layout().packet_len(), 12 + 16 * 32 * 2);
+        // Packet-count derivations follow the SOURCE packet duration: the jitter
+        // buffer holds source packets, so 3 s of catchup is 1500 of them at 2 ms.
+        assert_eq!(c.catchup_max_packets(), 1500);
+
+        let c: Config = parse(MINIMAL).unwrap();
+        assert_eq!(c.spp_in(), c.spp_out);
+        assert_eq!(c.in_layout(), c.layout());
+        assert_eq!(c.packet_ms_in(), c.packet_ms());
+
+        // Larger than the output would hold audio back to split it; zero is
+        // meaningless; 48 lasts exactly 3 ms and is fine; 33 does not last a
+        // whole number of milliseconds and the integer-ms depth math would
+        // silently round.
+        assert!(with("spp_in = 0").is_err());
+        assert!(with("spp_in = 320").is_err());
+        assert!(with("spp_in = 48").is_ok());
+        assert!(with("spp_in = 33").is_err());
     }
 
     /// The production geometry, derived rather than hardcoded. 5132 is what the

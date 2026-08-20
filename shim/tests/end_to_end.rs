@@ -302,3 +302,87 @@ async fn every_output_packet_has_exactly_the_expected_length() {
         total
     );
 }
+
+/// The source may send smaller packets than the consumer receives: 32-sample
+/// (2 ms) source packets must come out as consumer-sized 160-sample packets,
+/// gapless and channel-aligned. This is the "framing moves to the shim" phase
+/// the pipeline's in/out layout split existed for.
+#[tokio::test]
+async fn small_source_packets_reframe_to_consumer_geometry() {
+    let l_in = PacketLayout::new(16, 32, 12);
+    let l_out = layout();
+
+    let pi_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pi_port = pi_listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut sock, _) = pi_listener.accept().await.expect("fake Pi: accept failed");
+        for id in 0..600 {
+            if sock.write_all(&make_packet(&l_in, id)).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    });
+
+    let sink = Sink::bind("127.0.0.1:0", l_out.packet_len()).await.unwrap();
+    let sink_port = sink.local_addr().unwrap().port();
+    let cfg = parse_config(&format!(
+        "source_host = \"127.0.0.1\"\nsource_port = {}\nsink_port = {}\nspp_in = 32\n",
+        pi_port, sink_port
+    ))
+    .expect("spp_in config must be valid");
+    tokio::spawn(pipeline::run_with_sink(cfg, sink));
+
+    let mut consumer = connect_retrying(sink_port).await;
+    let mut c0 = vec![0i16; l_out.spp];
+    let mut cx = vec![0i16; l_out.spp];
+
+    // Skip the priming silence, same discipline as the clean-stream test.
+    let first = timeout(Duration::from_secs(5), async {
+        loop {
+            let buf = read_one_packet(&mut consumer, l_out.packet_len()).await;
+            deblock_channel(&buf, &l_out, 1, &mut cx);
+            if cx.iter().any(|&s| s != 0) {
+                break buf;
+            }
+        }
+    })
+    .await
+    .expect("still priming after 5 s with a 32-sample source");
+
+    let mut prev_id = Header::parse(&first).unwrap().pkt_id;
+    let mut last_diffs = vec![0i32; l_out.spp];
+    for _ in 0..8 {
+        let buf = read_one_packet(&mut consumer, l_out.packet_len()).await;
+        assert_eq!(buf.len(), l_out.packet_len());
+        let h = Header::parse(&buf).unwrap();
+        assert_eq!(h.pkt_id, prev_id + 1, "output ids must be gapless");
+        prev_id = h.pkt_id;
+
+        // Input channel c carries channel 0 plus c*1000, and linear interpolation
+        // preserves a constant offset exactly, so ch1 - ch0 must be 1000 scaled by
+        // whatever common fade gain is in force -- positive and never above 1000.
+        // A reframing bug that misaligned channel blocks would break this on the
+        // first packet.
+        deblock_channel(&buf, &l_out, 0, &mut c0);
+        deblock_channel(&buf, &l_out, 1, &mut cx);
+        for i in 0..l_out.spp {
+            let diff = cx[i] as i32 - c0[i] as i32;
+            assert!(
+                (1..=1000).contains(&diff),
+                "ch1-ch0 = {} at sample {}: channel blocks misaligned",
+                diff,
+                i
+            );
+            last_diffs[i] = diff;
+        }
+    }
+    // By the eighth packet the fade-in has long finished: the offset must be
+    // exactly 1000, i.e. unity gain and sample-exact channel alignment.
+    assert!(
+        last_diffs.iter().all(|&d| d == 1000),
+        "gain never reached unity: {:?}",
+        &last_diffs[..8]
+    );
+}

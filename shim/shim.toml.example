@@ -26,6 +26,13 @@ spp_out = 160
 header_len = 12
 sample_rate = 16000
 
+# Samples per packet on the SOURCE side -- our half of the wire, so unlike the
+# consumer geometry above it is a free choice. The shim reframes whatever arrives
+# into spp_out-sample output packets. 32 (2 ms) is the deployed value: the sender
+# stops waiting for the 160th sample (~8 ms less capture latency) and the jitter
+# buffer gains 2 ms granularity. Omit if the source still sends 160-sample packets.
+spp_in = 32
+
 # --- Depth: how much jitter to absorb, and how much backlog to swallow ------------
 # Ceiling on the adaptive target depth, and the threshold that separates ordinary
 # jitter from an outage. Arrival delays beyond it are excluded from the statistic, so

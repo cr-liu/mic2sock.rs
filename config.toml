@@ -30,7 +30,10 @@ speaker_idx = 0
 listen_port = 7998
 max_clients = 100
 header_len = 12
-sample_per_packet = 160
+# 32 samples = 2 ms per packet (1036 bytes). The shim reframes to the consumer's
+# 160-sample packets; smaller send units cut capture-side latency by ~8 ms and
+# give the shim's jitter machinery 2 ms granularity. Must match the shim's spp_in.
+sample_per_packet = 32
 
 [tcp_receiver]
 host = "none"

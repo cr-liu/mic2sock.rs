@@ -35,9 +35,13 @@ use tokio::sync::mpsc;
 const METRICS_INTERVAL_MS: u64 = 60_000;
 /// Ramp used entering and leaving an outage.
 const FADE_MS: u64 = 20;
-/// Largest gap concealed by repeating; beyond this the timeline breaks and is counted.
-const MAX_CONCEAL_PACKETS: usize = 8;
-const REORDER_WINDOW: usize = 16;
+/// Largest gap concealed by repeating, in milliseconds of audio; beyond this the
+/// timeline breaks and is counted. In ms rather than packets: the source packet
+/// size is configurable now, and a packet-count horizon would silently shrink
+/// five-fold the day the source moved to 2 ms packets.
+const CONCEAL_HORIZON_MS: u64 = 80;
+/// How far out-of-order an arrival may be and still be reordered, in ms.
+const REORDER_WINDOW_MS: u64 = 160;
 /// Depth of the channel to the sink, in packets.
 ///
 /// Small on purpose, though it is no longer the release clock (the pacer is): it
@@ -169,10 +173,11 @@ fn spawn_pacer(period_ms: u64) -> mpsc::Receiver<()> {
 /// not a theoretical one — and would also mean a test process could be killed by this
 /// module's `exit` on a bind failure.
 pub async fn run_with_sink(cfg: Config, sink: Sink) {
-    // The input geometry matches the output for now: the Pi's sample_per_packet is
-    // only reduced in a later phase, and the reframer does not require the two to
-    // divide each other.
-    let in_layout = cfg.layout();
+    // The source may send smaller packets than the consumer receives (spp_in <=
+    // spp_out); the reframer accumulates, and does not require the two to divide
+    // each other. Everything upstream of the reframer -- jitter buffer, depth
+    // estimator, pacer -- runs in units of SOURCE packets.
+    let in_layout = cfg.in_layout();
     let out_layout = cfg.layout();
 
     let source_queue =
@@ -197,16 +202,16 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
     let connected = sink.connected();
     tokio::spawn(sink.run(sink_rx));
 
-    let packet_ms = cfg.packet_ms();
+    let packet_ms = cfg.packet_ms_in();
     let mut tick_rx = spawn_pacer(packet_ms);
     let mut est = DepthEstimator::new(cfg.d_max_adaptive_ms, packet_ms);
     let mut jb = JitterBuffer::new(
         cfg.outage_threshold_ms,
-        MAX_CONCEAL_PACKETS,
+        (CONCEAL_HORIZON_MS / packet_ms).max(1) as usize,
         // Accepting far ahead of the release position is what lets a burst be
         // buffered at all; it is unrelated to the conceal horizon.
         (cfg.catchup_max_packets() + cfg.max_depth_packets()).max(64),
-        REORDER_WINDOW,
+        (REORDER_WINDOW_MS / packet_ms).max(1) as usize,
         cfg.retain_cap_packets(),
     );
     let mut ctl = DepthController::new(1.0, cfg.catchup_clamp, cfg.catchup_slew_per_sec);
