@@ -19,6 +19,7 @@
 
 use crate::config::Config;
 use crate::depth::{Arrival, DepthEstimator};
+use crate::elide::{EnergyGate, ELIDE_BUDGET_PER_TICK, ELIDE_MARGIN_MS};
 use crate::jitter::{JitterBuffer, Released, State as JitterState};
 use crate::metrics::Metrics;
 use crate::reframe::Reframer;
@@ -216,6 +217,7 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
     );
     let mut ctl = DepthController::new(1.0, cfg.catchup_clamp, cfg.catchup_slew_per_sec);
     let mut refr = Reframer::new(in_layout, out_layout, 0, cfg.sample_rate, FADE_MS);
+    let mut gate = EnergyGate::new();
     let mut m = Metrics::new();
     let max_depth_packets = cfg.max_depth_packets();
 
@@ -318,27 +320,46 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
             ctl.update(error, dt.max(1e-3));
         }
 
-        // One release per accepted write: the consumer paces this.
+        // One packet reaches the reframer per tick. While the buffer is deeper
+        // than target + margin, released packets that measure as room tone are
+        // elided -- dropped without reaching the reframer -- and the release
+        // repeats within a per-tick budget, so a backlog drains at up to
+        // ELIDE_BUDGET_PER_TICK times real time without touching speech.
         let now = now_ms();
-        match jb.release_with_target(now, target_packets) {
-            Released::Real(p) => refr.push_audible(&p),
-            Released::Repeat(p) => {
-                m.conceal_events += 1;
-                m.conceal_samples += in_layout.spp as u64;
-                est.on_conceal(now);
-                // Not `push_packet`: the audio is a repeat, so its header names a time
-                // that has already been emitted and must not anchor the timeline.
-                refr.push_repeat(&p);
+        let mut budget = ELIDE_BUDGET_PER_TICK;
+        loop {
+            budget -= 1;
+            match jb.release_with_target(now, target_packets) {
+                Released::Real(p) => {
+                    if cfg.silence_elision {
+                        // The gate observes every real release, elided or not:
+                        // its noise floor and hangover only stay honest if they
+                        // see the whole stream.
+                        let quiet = gate.may_elide(&p, &in_layout, now);
+                        let over_target = (jb.buffered() as u64 * packet_ms)
+                            > est.target_ms() + ELIDE_MARGIN_MS;
+                        if quiet && over_target && budget > 0 {
+                            m.silence_elided += 1;
+                            continue;
+                        }
+                    }
+                    refr.push_audible(&p);
+                }
+                Released::Repeat(p) => {
+                    m.conceal_events += 1;
+                    m.conceal_samples += in_layout.spp as u64;
+                    est.on_conceal(now);
+                    // Not `push_packet`: the audio is a repeat, so its header names a time
+                    // that has already been emitted and must not anchor the timeline.
+                    refr.push_repeat(&p);
+                }
+                Released::Silence => {
+                    m.silence_packets += 1;
+                    refr.push_silence()
+                }
+                Released::Nothing => {}
             }
-            Released::Silence => {
-                m.silence_packets += 1;
-                refr.push_silence()
-            }
-            Released::Nothing => {
-                // Nothing buffered and not yet an outage: skip this tick. The next
-                // tick is the wait -- no polling needed now that the loop is paced.
-                continue;
-            }
+            break;
         }
 
         refr.drain(ctl.step(), &mut pending);

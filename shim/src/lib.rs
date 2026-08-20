@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod depth;
+pub mod elide;
 pub mod jitter;
 pub mod metrics;
 pub mod pipeline;

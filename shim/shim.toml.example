@@ -70,6 +70,14 @@ outage_threshold_ms = 200
 # idle. Only `true` is implemented.
 keep_source_when_idle = true
 
+# Drop released source packets that measure as room tone while the buffer sits
+# above target depth + 40 ms, draining a backlog at up to 16x real time instead
+# of the resampler's 2.5%. Only near-silence is lost; speech is kept whole with
+# a 50 ms hangover, and nothing is elided at normal depth. The silence_elided
+# counter in the metrics is the audit trail. MUST be turned off if an AEC
+# reference channel ever returns: elision warps the timeline non-uniformly.
+silence_elision = true
+
 # Append one JSON object per minute here. This is the instrument for answering "how
 # low can this link actually go" (read p99_9_ms) and for judging whether a change
 # helped. Comment out to disable.

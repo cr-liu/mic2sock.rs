@@ -386,3 +386,89 @@ async fn small_source_packets_reframe_to_consumer_geometry() {
         &last_diffs[..8]
     );
 }
+
+/// A deep backlog whose middle is room tone must drain at many times real
+/// time when silence elision is on: the loud marker at the tail has to reach
+/// the consumer far sooner than real-time playback of the silence would
+/// allow, and the loud content ahead of the silence must arrive intact.
+#[tokio::test]
+async fn silence_elision_drains_a_quiet_backlog_fast() {
+    let l_in = PacketLayout::new(16, 32, 12);
+    let l_out = layout();
+
+    fn flat_packet(l: &PacketLayout, pkt_id: i32, amplitude: i16) -> Vec<u8> {
+        let mut buf = make_packet(l, pkt_id);
+        let samples = vec![amplitude; l.spp];
+        for c in 0..l.n_ch {
+            reblock_channel(&mut buf, l, c, &samples);
+        }
+        buf
+    }
+
+    let pi_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pi_port = pi_listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut sock, _) = pi_listener.accept().await.expect("fake Pi: accept failed");
+        // One back-to-back burst: 1.2 s of audio arriving at once is exactly
+        // the post-stall shape elision exists for, and it sidesteps the tokio
+        // timer granularity that made a per-packet sleep undershoot the
+        // release rate (no backlog ever formed and the test measured nothing).
+        let mut burst = Vec::new();
+        for id in 0..600 {
+            // 0..300 speech, 300..560 room tone, 560..600 a louder marker.
+            let amp = if id < 300 {
+                2000
+            } else if id < 560 {
+                0
+            } else {
+                3000
+            };
+            burst.extend_from_slice(&flat_packet(&l_in, id, amp));
+        }
+        if sock.write_all(&burst).await.is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+    });
+
+    let sink = Sink::bind("127.0.0.1:0", l_out.packet_len()).await.unwrap();
+    let sink_port = sink.local_addr().unwrap().port();
+    let cfg = parse_config(&format!(
+        "source_host = \"127.0.0.1\"\nsource_port = {}\nsink_port = {}\nspp_in = 32\n\
+         d_max_adaptive_ms = 20\nsilence_elision = true\n",
+        pi_port, sink_port
+    ))
+    .expect("elision config must be valid");
+    tokio::spawn(pipeline::run_with_sink(cfg, sink));
+
+    let mut consumer = connect_retrying(sink_port).await;
+    let mut c0 = vec![0i16; l_out.spp];
+    let mut saw_speech = false;
+    let mut marker_at = None;
+
+    // Without elision the 260 packets of room tone play for 520 ms: the marker
+    // arrives around output packet 112 at the earliest. With elision draining
+    // at up to 16x real time it must arrive far sooner. The bound is loose
+    // enough to be scheduling-proof but firmly below the no-elision floor.
+    for i in 0..110 {
+        let buf = read_one_packet(&mut consumer, l_out.packet_len()).await;
+        deblock_channel(&buf, &l_out, 0, &mut c0);
+        if c0.iter().any(|&s| s.abs() > 1200 && s.abs() < 2400) {
+            saw_speech = true;
+        }
+        if c0.iter().any(|&s| s.abs() > 2500) {
+            marker_at = Some(i);
+            break;
+        }
+    }
+    assert!(
+        saw_speech,
+        "the speech ahead of the silence never arrived; elision must not eat loud content"
+    );
+    let at = marker_at.expect("marker never arrived: the quiet backlog was not elided");
+    assert!(
+        at < 95,
+        "marker arrived at output packet {} -- no faster than real time; elision inert",
+        at
+    );
+}

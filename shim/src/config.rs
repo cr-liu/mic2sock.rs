@@ -78,6 +78,13 @@ pub struct Config {
     /// Where to append JSONL metrics. `None` disables metrics output.
     #[serde(default)]
     pub metrics_path: Option<PathBuf>,
+    /// Drop released source packets that measure as room tone while the buffer
+    /// is deeper than target + margin, so a backlog drains at up to 16x real
+    /// time instead of the resampler's 2.5%. Loses only near-silence; speech
+    /// is kept whole with a hangover. **Must stay off once an AEC reference
+    /// channel exists** — elision warps the timeline non-uniformly (spec §7.2).
+    #[serde(default)]
+    pub silence_elision: bool,
 }
 
 fn default_sink_port() -> u16 {

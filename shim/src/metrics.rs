@@ -27,6 +27,9 @@ pub struct Metrics {
     /// conceal (that counts Repeat only), so without its own counter the JSONL
     /// cannot distinguish a healthy stream from one that is mostly dead air.
     pub silence_packets: u64,
+    /// Source packets dropped by the energy gate while draining a backlog.
+    /// By design these carried only room tone; the counter is the audit trail.
+    pub silence_elided: u64,
     last_flush_ms: u64,
 }
 
@@ -49,6 +52,7 @@ impl Default for Metrics {
             catchup_overflow: 0,
             max_depth_hit: 0,
             silence_packets: 0,
+            silence_elided: 0,
             last_flush_ms: 0,
         }
     }
@@ -132,7 +136,7 @@ impl Metrics {
                 "\"conceal_samples\":{},\"outage_events\":{},\"resync_events\":{},",
                 "\"late_discards\":{},\"duplicate_discards\":{},",
                 "\"catchup_overflow\":{},\"max_depth_hit\":{},",
-                "\"silence_packets\":{},",
+                "\"silence_packets\":{},\"silence_elided\":{},",
                 "\"d_target_ms\":{},\"step\":{},",
                 "\"p50_ms\":{},\"p99_ms\":{},\"p99_9_ms\":{}}}"
             ),
@@ -147,6 +151,7 @@ impl Metrics {
             self.catchup_overflow,
             self.max_depth_hit,
             self.silence_packets,
+            self.silence_elided,
             d_target_ms,
             step,
             self.percentile_ms(50.0),
@@ -339,6 +344,7 @@ mod tests {
                 "catchup_overflow",
                 "max_depth_hit",
                 "silence_packets",
+                "silence_elided",
                 "d_target_ms",
                 "step",
                 "p50_ms",
