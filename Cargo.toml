@@ -1,15 +1,12 @@
-[package]
-name = "mic2sock"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+resolver = "2"
+members = ["protocol", "clocksync", "shim", "mic2sock"]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[dependencies]
-jack = { version = "0.11" }
-serde = { version = "1.0", features = ["derive", "std"] }
-toml = "0.7"
-tokio = { version = "1.28", features = ["full"] }
-bytes = "1.4"
-crossbeam = "0.8"
-arc-swap = "1.6"
+# mic2sock is excluded: it needs libjack, and jack-sys's build script panics on
+# any machine without jack.pc (including CI containers). So a bare `cargo build`
+# / `cargo test` covers only the pure-logic crates and silently does NOT build
+# the daemon. On the Pi: cargo build -p mic2sock --release
+#
+# shim IS included: it has no libjack dependency and must build everywhere,
+# including the Windows box that runs it.
+default-members = ["protocol", "clocksync", "shim"]

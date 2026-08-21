@@ -1,0 +1,87 @@
+# Copy to shim.toml, placed NEXT TO shim.exe -- not in the working directory. On
+# Windows the exe is routinely started from an unrelated CWD, so the config is looked
+# up beside the executable. Override with `shim.exe --config <path>`.
+#
+# A missing or malformed file is a hard error with exit code 2. This deliberately does
+# not behave like mic2sock, which writes defaults to a differently-named file and
+# keeps running -- that makes a misconfiguration look like a runtime mystery.
+
+# --- The Pi running mic2sock -------------------------------------------------------
+source_host = "192.168.1.50"
+source_port = 7998
+
+# --- Where the black box connects --------------------------------------------------
+# Point the consumer at 127.0.0.1:<sink_port> instead of at the Pi.
+sink_port = 7998
+
+# --- Packet geometry --------------------------------------------------------------
+# These must equal the values the consumer was built for; the shim refuses to start
+# otherwise, because the consumer parses by fixed byte offset and cannot report a
+# disagreement -- it would just mis-read every field of every packet, forever.
+# The packet length is derived from them (16 * 160 * 2 + 12 = 5132 bytes), never
+# hardcoded. A different array means changing the CONSUMER_* constants in
+# shim/src/config.rs and rebuilding the consumer to match.
+n_ch = 16
+spp_out = 160
+header_len = 12
+sample_rate = 16000
+
+# Samples per packet on the SOURCE side -- our half of the wire, so unlike the
+# consumer geometry above it is a free choice. The shim reframes whatever arrives
+# into spp_out-sample output packets. 32 (2 ms) is the deployed value: the sender
+# stops waiting for the 160th sample (~8 ms less capture latency) and the jitter
+# buffer gains 2 ms granularity. Omit if the source still sends 160-sample packets.
+spp_in = 32
+
+# --- Depth: how much jitter to absorb, and how much backlog to swallow ------------
+# Ceiling on the adaptive target depth, and the threshold that separates ordinary
+# jitter from an outage. Arrival delays beyond it are excluded from the statistic, so
+# that one long stall cannot pin the target at its own length.
+d_max_adaptive_ms = 80
+
+# How much backlog is absorbed by time compression rather than discarded.
+# MUST equal the Pi's tcp_sender backlog: content is simply dropped at whichever end
+# has the smaller value. Absorbing N seconds takes N/catchup_clamp seconds, so 3 s of
+# backlog runs for about two minutes at slightly raised latency. That is the real
+# price of losing nothing, and it was accepted knowingly.
+catchup_max_ms = 3000
+
+# Largest speed deviation while catching up, and how fast it may change.
+# The slew limit is what buys inaudibility -- what gets heard is the glide into a
+# deviation, not the deviation itself, so a bigger clamp with a slow slew is *less*
+# audible than a small clamp applied abruptly. Do not raise catchup_slew_per_sec.
+# Lower catchup_clamp to about 0.015 if the content is mostly music rather than speech.
+catchup_clamp = 0.025
+catchup_slew_per_sec = 0.002
+
+# Safety valve: if the consumer stops reading, discard rather than grow without bound.
+# Must be at least d_max_adaptive_ms + catchup_max_ms, or the valve fires on every
+# outage and throws away exactly the backlog catchup exists to absorb. Should never
+# trigger in normal operation -- if max_depth_hit in the metrics is non-zero, the
+# consumer is not keeping up.
+max_depth_ms = 3500
+
+# No arrivals for this long means an outage has begun: fade out and emit silence.
+outage_threshold_ms = 200
+
+# Keep the connection to the Pi open while no consumer is attached, so the
+# arrival-delay statistic stays warm. Otherwise the buffer depth is guesswork for the
+# first 30 seconds after the consumer appears. Costs 4.4 Mbit/s of air time while
+# idle. Only `true` is implemented.
+keep_source_when_idle = true
+
+# Drop released source packets that measure as room tone, but ONLY while the
+# buffer is genuinely backed up: the gate arms above target depth + 500 ms and
+# disarms once the drain reaches target + 100 ms (hysteresis, so ordinary
+# jitter never triggers it). Quiet requires both the packet mean AND peak to
+# sit near the measured noise floor -- a lone consonant keeps its packet --
+# plus a 100 ms hangover after anything loud. Drains at up to 16x real time.
+# The silence_elided counter in the metrics is the audit trail. MUST be turned
+# off if an AEC reference channel ever returns: elision warps the timeline
+# non-uniformly.
+silence_elision = true
+
+# Append one JSON object per minute here. This is the instrument for answering "how
+# low can this link actually go" (read p99_9_ms) and for judging whether a change
+# helped. Comment out to disable.
+# metrics_path = "C:/mic/shim-metrics.jsonl"

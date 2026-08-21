@@ -1,0 +1,15 @@
+//! Library face of the shim, so integration tests can drive the pipeline
+//! directly instead of spawning the binary — a failure then points at a module
+//! rather than a process.
+
+pub mod config;
+pub mod depth;
+pub mod elide;
+pub mod jitter;
+pub mod metrics;
+pub mod pipeline;
+pub mod reframe;
+pub mod sink;
+pub mod source;
+
+pub use config::{parse as parse_config, Config};

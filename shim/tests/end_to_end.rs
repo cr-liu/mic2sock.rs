@@ -1,0 +1,489 @@
+//! End-to-end: a fake Pi feeds the shim's source, a fake consumer reads its
+//! sink, and the output must be correctly framed, gapless in id, and
+//! channel-aligned.
+//!
+//! The pipeline is driven through `pipeline::run_with_sink` rather than by
+//! spawning the binary, so a failure points at a module instead of a process.
+//! Both endpoints (`Sink::bind` here, `TcpListener::bind` for the fake Pi) bind
+//! port 0 exactly once and read back the assigned port -- never bind-then-drop
+//! a "free" port, which would race the next test picking it up before this one
+//! rebinds it.
+//!
+//! The geometry is the real, pinned production shape (16 channels, 160
+//! samples/packet, 5132-byte packets): `Config::validate` refuses anything
+//! smaller, so there is no scaled-down geometry available to test against.
+
+use protocol::block::{deblock_channel, reblock_channel};
+use protocol::{Header, PacketLayout};
+use shim_lib::{parse_config, pipeline, sink::Sink};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::time::timeout;
+
+/// The production geometry. `Config::validate` pins `n_ch`/`spp_out`/
+/// `header_len`/`sample_rate` to exactly these values, so this is not a choice
+/// -- it is the only shape `parse_config` will accept.
+fn layout() -> PacketLayout {
+    PacketLayout::new(16, 160, 12)
+}
+
+/// Builds one well-formed input packet. Every channel carries the same 0..spp
+/// ramp shifted by `channel * 1000` (max offset 16000, comfortably inside
+/// `i16` with the ramp itself, so nothing saturates). That constant per-channel
+/// shift is what a downstream echo-canceller depends on, and it is also what
+/// makes the check exact after resampling: `Resampler` evaluates every channel
+/// at the same fractional phase (see `clocksync::Resampler`), and the Hermite
+/// basis it uses is an affine combination of the four taps whose coefficients
+/// sum to zero except for the constant term -- so shifting every tap of one
+/// channel by a fixed integer shifts its interpolated output by exactly that
+/// integer, with no rounding-tie divergence between channels (`to_i16` rounds
+/// half-up, which `clocksync::hermite::to_i16`'s doc comment pins as exactly
+/// translation-invariant away from saturation). Concretely: this is *not* the
+/// same thing as building each channel's value with a modulo and then adding
+/// the per-channel offset afterwards -- that would wrap unpredictably once the
+/// sum passed the modulus and break the constant-offset property the check
+/// relies on.
+fn make_packet(l: &PacketLayout, pkt_id: i32) -> Vec<u8> {
+    let mut buf = vec![0u8; l.packet_len()];
+    Header {
+        device_id: 7,
+        secs: 1_700_000_000,
+        ms: 0,
+        pkt_id,
+    }
+    .write_to(&mut buf);
+    for c in 0..l.n_ch {
+        let samples: Vec<i16> = (0..l.spp).map(|i| i as i16 + (c as i16) * 1000).collect();
+        reblock_channel(&mut buf, l, c, &samples);
+    }
+    buf
+}
+
+/// Plays the role of the Pi: accepts one connection on an already-bound
+/// listener and emits `count` real, sequential headers, skipping the ids in
+/// `skip`.
+///
+/// `TcpSource`'s geometry cross-check inspects only the first
+/// `GEOMETRY_CHECK_PACKETS` (8) *framed* packets of a connection
+/// (`shim/src/source.rs`), and treats a gap inside that window as a fatal
+/// configuration mismatch -- fatal enough that it calls `std::process::exit`,
+/// which tears down the whole test binary rather than failing one test.
+/// Callers must therefore keep every id in `skip` at 8 or above.
+async fn fake_pi(listener: TcpListener, count: i32, skip: Vec<i32>) {
+    let l = layout();
+    let (mut sock, _) = listener.accept().await.expect("fake Pi: accept failed");
+    for id in 0..count {
+        if skip.contains(&id) {
+            continue;
+        }
+        if sock.write_all(&make_packet(&l, id)).await.is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    // Keep the socket open a little past the last write so a test that is
+    // still reading is never met with an EOF it did not ask for. This is not
+    // a synchronization wait -- nothing here is being awaited for readiness --
+    // it just holds a resource open past its last use.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// Builds a config against the pinned production geometry. Only the fields
+/// that vary between tests are set explicitly; the rest -- including
+/// `n_ch`/`spp_out`/`header_len`/`sample_rate`, which already default to the
+/// production values -- take whatever `parse_config` fills in.
+fn test_config(source_port: u16, sink_port: u16) -> shim_lib::Config {
+    let text = format!(
+        "source_host = \"127.0.0.1\"\nsource_port = {}\nsink_port = {}\n",
+        source_port, sink_port
+    );
+    parse_config(&text).expect("test config must be valid")
+}
+
+/// Retries the connect until the sink's listener has a pending connection to
+/// hand over. There is no notification for "the listener is ready to accept",
+/// so a short poll is the only observable event available before the first
+/// successful connect; the surrounding `timeout` is what keeps a wiring
+/// mistake from hanging the test instead of failing it.
+async fn connect_retrying(port: u16) -> TcpStream {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(s) = TcpStream::connect(("127.0.0.1", port)).await {
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("shim sink never accepted a connection")
+}
+
+/// Reads one whole output packet, with a timeout so a stalled pipeline fails
+/// the test instead of hanging the run.
+async fn read_one_packet(consumer: &mut TcpStream, want: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; want];
+    timeout(Duration::from_secs(10), consumer.read_exact(&mut buf))
+        .await
+        .expect("timed out waiting for an output packet")
+        .expect("consumer read failed");
+    buf
+}
+
+/// Boots the whole rig — fake Pi, sink bound on port 0, pipeline — and returns the
+/// port the fake consumer should read from. One home for the eight lines every test
+/// repeated, and the one place the bind-port-0 discipline lives.
+async fn start_rig(count: i32, skip: Vec<i32>, pkt_len: usize) -> u16 {
+    let pi_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pi_port = pi_listener.local_addr().unwrap().port();
+    tokio::spawn(fake_pi(pi_listener, count, skip));
+
+    let sink = Sink::bind("127.0.0.1:0", pkt_len).await.unwrap();
+    let sink_port = sink.local_addr().unwrap().port();
+    tokio::spawn(pipeline::run_with_sink(
+        test_config(pi_port, sink_port),
+        sink,
+    ));
+    sink_port
+}
+
+#[tokio::test]
+async fn clean_stream_arrives_correctly_framed_and_channel_aligned() {
+    let l = layout();
+    let sink_port = start_rig(60, vec![], l.packet_len()).await;
+
+    let mut consumer = connect_retrying(sink_port).await;
+    let mut prev_id: Option<i32> = None;
+    let mut c0 = vec![0i16; l.spp];
+    let mut cx = vec![0i16; l.spp];
+
+    // Cold start primes: the buffer holds silence until it has the target depth, because
+    // occupancy only grows by concealing and a buffer that released its first arrival
+    // would stay at zero depth and forward the burstiness it exists to absorb. Skip that
+    // preamble. Its bound is a *duration*, not a packet count: this consumer reads flat
+    // out, and a flat-out reader is the clock, so however many silence packets fit into
+    // the few milliseconds it takes the source to deliver the target depth is however
+    // many there are. A count bound here failed one run in ten on scheduling luck.
+    let deadline = Duration::from_secs(5);
+    let buf = timeout(deadline, async {
+        loop {
+            let buf = read_one_packet(&mut consumer, l.packet_len()).await;
+            deblock_channel(&buf, &l, 1, &mut cx);
+            if cx.iter().any(|&s| s != 0) {
+                break buf;
+            }
+        }
+    })
+    .await
+    .expect("still priming after 5 s; the buffer is not retaining a window");
+
+    let mut first = Some(buf);
+    for _ in 0..8 {
+        let buf = match first.take() {
+            Some(b) => b,
+            None => read_one_packet(&mut consumer, l.packet_len()).await,
+        };
+
+        let h = Header::parse(&buf).expect("output packet too short to hold a header");
+        if let Some(p) = prev_id {
+            assert_eq!(h.pkt_id, p + 1, "output ids must be gapless");
+        }
+        prev_id = Some(h.pkt_id);
+
+        // Channel c is channel 0 plus c*1000 by construction, so the difference between
+        // two channels at the same sample is c*1000 times whatever gain is in force.
+        // Checking the difference rather than the value cancels the resampler's phase,
+        // which drifts by design; estimating the gain per sample rather than asserting
+        // 1000 outright is what makes this valid during a fade as well, where every
+        // channel is scaled by one common ramp.
+        //
+        // A *common* gain is the point: it preserves inter-channel phase and relative
+        // amplitude, which is what the downstream echo canceller depends on. A
+        // per-channel difference in either would not.
+        deblock_channel(&buf, &l, 0, &mut c0);
+        let mut top = vec![0i16; l.spp];
+        deblock_channel(&buf, &l, l.n_ch - 1, &mut top);
+        for c in 1..l.n_ch {
+            deblock_channel(&buf, &l, c, &mut cx);
+            for i in 0..l.spp {
+                let gain = (top[i] - c0[i]) as f64 / ((l.n_ch - 1) * 1000) as f64;
+                if gain < 0.01 {
+                    continue; // fully faded: all zeros carry no information
+                }
+                let want = (c as f64 * 1000.0 * gain).round() as i16;
+                let got = cx[i] - c0[i];
+                assert!(
+                    (got - want).abs() <= 2,
+                    "inter-channel offset broken: packet {} channel {} sample {}: \
+                     {} vs {} (gain {:.4})",
+                    h.pkt_id,
+                    c,
+                    i,
+                    got,
+                    want,
+                    gain
+                );
+            }
+        }
+    }
+}
+
+/// A gap in the source must still yield a gapless id sequence downstream: the
+/// consumer's behaviour on an id jump is unknown, so it must never see one.
+///
+/// This holds unconditionally in `Reframer::drain` -- `out_pkt_id` advances by
+/// exactly one for every emitted packet regardless of whether it carried real
+/// audio, a repeat, or silence -- so this test is exercising that guarantee
+/// end-to-end rather than a timing-sensitive path.
+#[tokio::test]
+async fn a_source_gap_still_yields_a_gapless_output_id_sequence() {
+    let l = layout();
+    // All three skipped ids are well past the first 8 packets that
+    // `TcpSource`'s geometry cross-check inspects (see `fake_pi`'s doc
+    // comment); a gap inside that window would exit the process instead of
+    // failing this test.
+    let sink_port = start_rig(80, vec![20, 21, 40], l.packet_len()).await;
+
+    let mut consumer = connect_retrying(sink_port).await;
+    let mut ids = Vec::new();
+    for _ in 0..40 {
+        let buf = read_one_packet(&mut consumer, l.packet_len()).await;
+        ids.push(
+            Header::parse(&buf)
+                .expect("output packet too short to hold a header")
+                .pkt_id,
+        );
+    }
+    for w in ids.windows(2) {
+        assert_eq!(w[1], w[0] + 1, "id gap in output: {:?}", ids);
+    }
+}
+
+/// Every output packet must be exactly `packet_len()` bytes, and the stream as
+/// a whole a clean multiple of it.
+///
+/// TCP carries no framing of its own, so a wrong packet length is not
+/// something a consumer can observe directly -- there is no length field to
+/// check it against. The only way to catch it from outside is indirectly: read
+/// exactly `packet_len()` bytes per iteration (so a short or long packet would
+/// misalign every following read) and confirm the header at each boundary
+/// keeps advancing by 1. A drift of even one byte would very quickly land a
+/// "header" on the wrong data and break that sequence.
+#[tokio::test]
+async fn every_output_packet_has_exactly_the_expected_length() {
+    let l = layout();
+    let want = l.packet_len();
+    let sink_port = start_rig(60, vec![], want).await;
+
+    let mut consumer = connect_retrying(sink_port).await;
+    const N: usize = 30;
+    let mut prev_id: Option<i32> = None;
+    let mut total = 0usize;
+    for _ in 0..N {
+        let buf = read_one_packet(&mut consumer, want).await;
+        assert_eq!(
+            buf.len(),
+            want,
+            "a short or long packet shifts every later boundary"
+        );
+        total += buf.len();
+        let id = Header::parse(&buf)
+            .expect("header did not parse at the expected boundary")
+            .pkt_id;
+        if let Some(p) = prev_id {
+            assert_eq!(id, p + 1, "boundary drifted: ids stopped advancing by 1");
+        }
+        prev_id = Some(id);
+    }
+    assert_eq!(
+        total % want,
+        0,
+        "{} bytes is not a whole number of packets",
+        total
+    );
+}
+
+/// The source may send smaller packets than the consumer receives: 32-sample
+/// (2 ms) source packets must come out as consumer-sized 160-sample packets,
+/// gapless and channel-aligned. This is the "framing moves to the shim" phase
+/// the pipeline's in/out layout split existed for.
+#[tokio::test]
+async fn small_source_packets_reframe_to_consumer_geometry() {
+    let l_in = PacketLayout::new(16, 32, 12);
+    let l_out = layout();
+
+    let pi_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pi_port = pi_listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut sock, _) = pi_listener.accept().await.expect("fake Pi: accept failed");
+        for id in 0..600 {
+            if sock.write_all(&make_packet(&l_in, id)).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    });
+
+    let sink = Sink::bind("127.0.0.1:0", l_out.packet_len()).await.unwrap();
+    let sink_port = sink.local_addr().unwrap().port();
+    let cfg = parse_config(&format!(
+        "source_host = \"127.0.0.1\"\nsource_port = {}\nsink_port = {}\nspp_in = 32\n",
+        pi_port, sink_port
+    ))
+    .expect("spp_in config must be valid");
+    tokio::spawn(pipeline::run_with_sink(cfg, sink));
+
+    let mut consumer = connect_retrying(sink_port).await;
+    let mut c0 = vec![0i16; l_out.spp];
+    let mut cx = vec![0i16; l_out.spp];
+
+    // Skip the priming silence, same discipline as the clean-stream test.
+    let first = timeout(Duration::from_secs(5), async {
+        loop {
+            let buf = read_one_packet(&mut consumer, l_out.packet_len()).await;
+            deblock_channel(&buf, &l_out, 1, &mut cx);
+            if cx.iter().any(|&s| s != 0) {
+                break buf;
+            }
+        }
+    })
+    .await
+    .expect("still priming after 5 s with a 32-sample source");
+
+    let mut prev_id = Header::parse(&first).unwrap().pkt_id;
+    let mut last_diffs = vec![0i32; l_out.spp];
+    for _ in 0..8 {
+        let buf = read_one_packet(&mut consumer, l_out.packet_len()).await;
+        assert_eq!(buf.len(), l_out.packet_len());
+        let h = Header::parse(&buf).unwrap();
+        assert_eq!(h.pkt_id, prev_id + 1, "output ids must be gapless");
+        prev_id = h.pkt_id;
+
+        // Input channel c carries channel 0 plus c*1000, and linear interpolation
+        // preserves a constant offset exactly, so ch1 - ch0 must be 1000 scaled by
+        // whatever common fade gain is in force -- positive and never above 1000.
+        // A reframing bug that misaligned channel blocks would break this on the
+        // first packet.
+        deblock_channel(&buf, &l_out, 0, &mut c0);
+        deblock_channel(&buf, &l_out, 1, &mut cx);
+        for i in 0..l_out.spp {
+            let diff = cx[i] as i32 - c0[i] as i32;
+            assert!(
+                (1..=1000).contains(&diff),
+                "ch1-ch0 = {} at sample {}: channel blocks misaligned",
+                diff,
+                i
+            );
+            last_diffs[i] = diff;
+        }
+    }
+    // By the eighth packet the fade-in has long finished: the offset must be
+    // exactly 1000, i.e. unity gain and sample-exact channel alignment.
+    assert!(
+        last_diffs.iter().all(|&d| d == 1000),
+        "gain never reached unity: {:?}",
+        &last_diffs[..8]
+    );
+}
+
+/// A deep backlog whose middle is room tone must drain at many times real
+/// time when silence elision is on: the loud marker at the tail has to reach
+/// the consumer far sooner than real-time playback of the silence would
+/// allow, and the loud content ahead of the silence must arrive intact.
+#[tokio::test]
+async fn silence_elision_drains_a_quiet_backlog_fast() {
+    let l_in = PacketLayout::new(16, 32, 12);
+    let l_out = layout();
+
+    fn flat_packet(l: &PacketLayout, pkt_id: i32, amplitude: i16) -> Vec<u8> {
+        let mut buf = make_packet(l, pkt_id);
+        let samples = vec![amplitude; l.spp];
+        for c in 0..l.n_ch {
+            reblock_channel(&mut buf, l, c, &samples);
+        }
+        buf
+    }
+
+    let pi_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pi_port = pi_listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut sock, _) = pi_listener.accept().await.expect("fake Pi: accept failed");
+        // One back-to-back burst: 1.2 s of audio arriving at once is exactly
+        // the post-stall shape elision exists for, and it sidesteps the tokio
+        // timer granularity that made a per-packet sleep undershoot the
+        // release rate (no backlog ever formed and the test measured nothing).
+        let mut burst = Vec::new();
+        for id in 0..600 {
+            // 0..50 room tone (the floor must calibrate on quiet before the
+            // contrast rule lets anything count as loud -- a speech-first
+            // stream is the mid-speech cold start the gate refuses, by
+            // design), 50..350 speech, 350..560 room tone, 560..600 a marker.
+            let amp = if id < 50 {
+                2
+            } else if id < 350 {
+                2000
+            } else if id < 560 {
+                0
+            } else {
+                3000
+            };
+            burst.extend_from_slice(&flat_packet(&l_in, id, amp));
+        }
+        if sock.write_all(&burst).await.is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+    });
+
+    let sink = Sink::bind("127.0.0.1:0", l_out.packet_len()).await.unwrap();
+    let sink_port = sink.local_addr().unwrap().port();
+    let cfg = parse_config(&format!(
+        "source_host = \"127.0.0.1\"\nsource_port = {}\nsink_port = {}\nspp_in = 32\n\
+         d_max_adaptive_ms = 20\nsilence_elision = true\n",
+        pi_port, sink_port
+    ))
+    .expect("elision config must be valid");
+    tokio::spawn(pipeline::run_with_sink(cfg, sink));
+
+    let mut consumer = connect_retrying(sink_port).await;
+    let mut c0 = vec![0i16; l_out.spp];
+    let mut speech_packets = 0;
+    let mut marker_at = None;
+
+    // Without elision the 260 packets of room tone play for 520 ms: the marker
+    // arrives around output packet 112 at the earliest. With elision draining
+    // at up to 16x real time it must arrive far sooner. The bound is loose
+    // enough to be scheduling-proof but firmly below the no-elision floor.
+    for i in 0..112 {
+        let buf = read_one_packet(&mut consumer, l_out.packet_len()).await;
+        deblock_channel(&buf, &l_out, 0, &mut c0);
+        if c0.iter().any(|&s| s.abs() > 1200 && s.abs() < 2400) {
+            speech_packets += 1;
+        }
+        if c0.iter().any(|&s| s.abs() > 2500) {
+            marker_at = Some(i);
+            break;
+        }
+    }
+    // 300 input packets of speech reframe to 60 output packets. Every one of
+    // them must arrive: speech is above the gate's absolute ceilings and can
+    // never classify as quiet, so any shortfall here means elision ate loud
+    // content. (A bare "saw some speech" assertion let the gate delete the
+    // last 50 speech packets invisibly -- review round 6, finding on this
+    // very test.)
+    assert!(
+        (57..=62).contains(&speech_packets),
+        "expected ~60 output packets of speech, got {}: elision ate loud content",
+        speech_packets
+    );
+    let at = marker_at.expect("marker never arrived: the quiet backlog was not elided");
+    // Without elision the marker cannot arrive before output packet 112
+    // (560 input packets at 1x). The bound sits below that floor with room
+    // for the hangover and the disarm tail.
+    assert!(
+        at < 104,
+        "marker arrived at output packet {} -- no faster than real time; elision inert",
+        at
+    );
+}

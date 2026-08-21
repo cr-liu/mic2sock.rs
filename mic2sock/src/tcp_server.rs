@@ -1,7 +1,6 @@
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-// use arc_swap::ArcSwap;
 // use tokio::sync::Notify;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -55,6 +54,14 @@ impl TcpServer {
             let socket = self.accept().await?;
             socket.set_nodelay(true)?;
             let ip_addr = socket.peer_addr().unwrap().to_string();
+            // Mark the audio stream CS6 (TOS 0xC0) so the Wi-Fi stack queues it as
+            // 802.11 AC_VO. Linux maps the TOS precedence bits to the WMM access
+            // category (cfg80211_classify8021d), and EDCA arbitration then wins the
+            // air against bulk best-effort traffic -- ours and neighbours' alike.
+            // DSCP EF would only reach AC_VI under that default mapping, hence CS6.
+            if let Err(err) = socket2::SockRef::from(&socket).set_tos(0xC0) {
+                println!("failed to set IP_TOS for {}: {}", ip_addr, err);
+            }
 
             let mut handler = SocketHandler {
                 ip_addr,
@@ -111,9 +118,19 @@ pub struct SocketHandler {
 impl SocketHandler {
     async fn run(&mut self) -> crate::Result<()> {
         while self.shutdown.load(Ordering::Relaxed) != true {
-            // self.notifyee.notified().await;
-            // let packet = self.packet_buf.load();
-            let packet = self.pkt_receiver.recv().await?;
+            // A client that stalls past the retained backlog loses exactly the
+            // overrun -- the stream resumes with a forward pkt_id jump that the
+            // consumer conceals in place. Killing the connection here instead
+            // (the old behaviour) also threw away the backlog that WAS retained,
+            // and forced a reconnect cycle on every Wi-Fi stall.
+            let packet = match self.pkt_receiver.recv().await {
+                Ok(p) => p,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    println!("{} lagged, {} packets dropped", self.ip_addr, n);
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            };
             tokio::select! {
                 // res = self.socket.write_all(packet.as_ref()) => {
                 res = self.socket.write_all(&packet) => {
