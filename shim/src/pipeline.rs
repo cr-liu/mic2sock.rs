@@ -209,7 +209,7 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
     // whether any packet was elided since. Cleared on non-real releases -- the
     // reframer's own fades govern those transitions.
     let mut last_tail: Option<Vec<i16>> = None;
-    let mut elided_since_push = false;
+    let mut splice_pending = false;
     let mut tick_rx = spawn_pacer(packet_ms);
     let mut est = DepthEstimator::new(cfg.d_max_adaptive_ms, packet_ms);
     let mut jb = JitterBuffer::new(
@@ -301,7 +301,7 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
             // packet gets ramped from the old source's final samples.
             gate.reset();
             last_tail = None;
-            elided_since_push = false;
+            splice_pending = false;
         }
 
         let dropped = jb.enforce_max_depth(max_depth_packets);
@@ -348,6 +348,10 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
         // ELIDE_BUDGET_PER_TICK times real time without touching speech.
         let now = now_ms();
         let mut budget = ELIDE_BUDGET_PER_TICK;
+        // A resync inside release_with_target skips the release position over
+        // a gap too wide to conceal; the packet it lands on was never adjacent
+        // to what preceded it, so it needs the same joint ramp as an elision.
+        let resyncs_before = jb.resync_events;
         loop {
             budget -= 1;
             match jb.release_with_target(now, target_packets) {
@@ -367,7 +371,7 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
                             && budget > 0
                         {
                             m.silence_elided += 1;
-                            elided_since_push = true;
+                            splice_pending = true;
                             continue;
                         }
                     }
@@ -376,17 +380,20 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
                     // previous packet's final samples so the joint carries no
                     // step at all (a step repeating at the packet rate during
                     // a sustained drain is a click train, not masked noise).
-                    if elided_since_push {
+                    if jb.resync_events != resyncs_before {
+                        splice_pending = true;
+                    }
+                    if splice_pending {
                         if let Some(tail) = &last_tail {
                             let mut spliced = p.to_vec();
                             EnergyGate::splice_ramp(&mut spliced, &in_layout, tail);
                             last_tail = Some(EnergyGate::tail_samples(&spliced, &in_layout));
-                            elided_since_push = false;
+                            splice_pending = false;
                             refr.push_audible(&spliced);
                             break;
                         }
+                        splice_pending = false;
                     }
-                    elided_since_push = false;
                     last_tail = Some(EnergyGate::tail_samples(&p, &in_layout));
                     refr.push_audible(&p);
                 }
@@ -394,16 +401,29 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
                     m.conceal_events += 1;
                     m.conceal_samples += in_layout.spp as u64;
                     est.on_conceal(now);
-                    // Not `push_packet`: the audio is a repeat, so its header names a time
-                    // that has already been emitted and must not anchor the timeline.
-                    refr.push_repeat(&p);
-                    last_tail = None;
-                    elided_since_push = false;
+                    // A repeat is spliced at both ends: its head is ramped from
+                    // the previous packet's tail here, and splice_pending ramps
+                    // the next real packet from the repeat's tail -- otherwise a
+                    // conceal on periodic content clicks at both joints (the
+                    // outage fade only covers Silence transitions).
+                    // Not `push_packet`: the audio is a repeat, so its header
+                    // names a time that has already been emitted and must not
+                    // anchor the timeline.
+                    if let Some(tail) = &last_tail {
+                        let mut r = p.to_vec();
+                        EnergyGate::splice_ramp(&mut r, &in_layout, tail);
+                        last_tail = Some(EnergyGate::tail_samples(&r, &in_layout));
+                        refr.push_repeat(&r);
+                    } else {
+                        last_tail = Some(EnergyGate::tail_samples(&p, &in_layout));
+                        refr.push_repeat(&p);
+                    }
+                    splice_pending = true;
                 }
                 Released::Silence => {
                     m.silence_packets += 1;
                     last_tail = None;
-                    elided_since_push = false;
+                    splice_pending = false;
                     refr.push_silence()
                 }
                 Released::Nothing => {}
