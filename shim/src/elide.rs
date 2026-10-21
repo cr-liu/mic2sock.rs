@@ -37,10 +37,6 @@ pub const ELIDE_DISENGAGE_OVER_TARGET_MS: u64 = 100;
 /// keeps breathing audible.
 pub const ELIDE_HANGOVER_MS: u64 = 100;
 
-/// Ceiling on releases per tick (the one pushed packet plus elided ones), so
-/// one tick never stalls the loop even against a deep all-silent backlog.
-pub const ELIDE_BUDGET_PER_TICK: usize = 16;
-
 /// Time observed before the gate trusts its floor estimate, converted to a
 /// packet count from the source packet duration — a raw packet count silently
 /// changed fivefold between 2 ms and legacy 10 ms framing.

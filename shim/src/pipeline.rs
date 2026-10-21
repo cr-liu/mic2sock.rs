@@ -19,7 +19,7 @@
 
 use crate::config::Config;
 use crate::depth::{Arrival, DepthEstimator};
-use crate::elide::{EnergyGate, ELIDE_BUDGET_PER_TICK};
+use crate::elide::EnergyGate;
 use crate::jitter::{JitterBuffer, Released, State as JitterState};
 use crate::metrics::Metrics;
 use crate::reframe::Reframer;
@@ -43,6 +43,12 @@ const FADE_MS: u64 = 20;
 const CONCEAL_HORIZON_MS: u64 = 80;
 /// How far out-of-order an arrival may be and still be reordered, in ms.
 const REORDER_WINDOW_MS: u64 = 160;
+/// Ceiling on input releases per output tick -- pushed and elided together. One
+/// output packet needs about 5 * step inputs (at most 6 at the upper clamp), so
+/// 40 leaves room for ~35 elided packets per tick: a quiet backlog drains at up
+/// to ~8x real time, and one tick can never stall the loop against a deep
+/// all-silent buffer.
+const RELEASE_BUDGET_PER_TICK: usize = 40;
 /// Depth of the channel to the sink, in packets.
 ///
 /// Small on purpose, though it is no longer the release clock (the pacer is): it
@@ -204,13 +210,21 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
     tokio::spawn(sink.run(sink_rx));
 
     let packet_ms = cfg.packet_ms_in();
+    let out_packet_ms = cfg.packet_ms();
     let mut gate = EnergyGate::new(packet_ms);
     // Splice continuity: the final samples of the last pushed real packet, and
     // whether any packet was elided since. Cleared on non-real releases -- the
     // reframer's own fades govern those transitions.
     let mut last_tail: Option<Vec<i16>> = None;
     let mut splice_pending = false;
-    let mut tick_rx = spawn_pacer(packet_ms);
+    // Ticks at the OUTPUT packet period, not the input one: each tick releases
+    // input until one output packet is framed. That is what closes the depth
+    // control loop -- at step > 1 an output packet consumes more input, so the
+    // buffer drains; at step < 1 less, so it fills. Ticking per input packet
+    // (the previous design) released exactly one input per tick whatever step
+    // was, which left step with no effect on depth at all: the controller was
+    // open-loop, and step only stretched or compressed the audio.
+    let mut tick_rx = spawn_pacer(out_packet_ms);
     let mut est = DepthEstimator::new(cfg.d_max_adaptive_ms, packet_ms);
     let mut jb = JitterBuffer::new(
         cfg.outage_threshold_ms,
@@ -341,13 +355,14 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
             ctl.update(error, dt.max(1e-3));
         }
 
-        // One packet reaches the reframer per tick. While the buffer is deeper
-        // than target + margin, released packets that measure as room tone are
-        // elided -- dropped without reaching the reframer -- and the release
-        // repeats within a per-tick budget, so a backlog drains at up to
-        // ELIDE_BUDGET_PER_TICK times real time without touching speech.
+        // One OUTPUT packet is framed per tick: input packets are released -- and
+        // pushed through the reframer -- until a drain yields one, normally
+        // 5 * step of them. While the buffer is deeper than target + margin,
+        // released packets that measure as room tone are elided (dropped without
+        // reaching the reframer) within the same per-tick budget, so a backlog
+        // drains at several times real time without touching speech.
         let now = now_ms();
-        let mut budget = ELIDE_BUDGET_PER_TICK;
+        let mut budget = RELEASE_BUDGET_PER_TICK;
         // A resync inside release_with_target skips the release position over
         // a gap too wide to conceal; the packet it lands on was never adjacent
         // to what preceded it, so it needs the same joint ramp as an elision.
@@ -390,12 +405,15 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
                             last_tail = Some(EnergyGate::tail_samples(&spliced, &in_layout));
                             splice_pending = false;
                             refr.push_audible(&spliced);
-                            break;
+                        } else {
+                            splice_pending = false;
+                            last_tail = Some(EnergyGate::tail_samples(&p, &in_layout));
+                            refr.push_audible(&p);
                         }
-                        splice_pending = false;
+                    } else {
+                        last_tail = Some(EnergyGate::tail_samples(&p, &in_layout));
+                        refr.push_audible(&p);
                     }
-                    last_tail = Some(EnergyGate::tail_samples(&p, &in_layout));
-                    refr.push_audible(&p);
                 }
                 Released::Repeat(p) => {
                     m.conceal_events += 1;
@@ -426,12 +444,16 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
                     splice_pending = false;
                     refr.push_silence()
                 }
-                Released::Nothing => {}
+                // Nothing buffered and not yet an outage: this tick produces no
+                // output. The consumer waits -- that is the honest state.
+                Released::Nothing => break,
             }
-            break;
+            refr.drain(ctl.step(), &mut pending);
+            if !pending.is_empty() || budget == 0 {
+                break;
+            }
         }
 
-        refr.drain(ctl.step(), &mut pending);
         for p in pending.drain(..) {
             // Usually instant (the queue is two deep and the consumer keeps up).
             // When the consumer stalls this blocks, ticks coalesce in their shallow

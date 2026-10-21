@@ -38,6 +38,13 @@ use protocol::{next_pkt_id, Header, PacketLayout};
 /// (its own timestamps carry a 10 ms fudge). What must not drift is *inter-channel*
 /// alignment, and that is unaffected: every channel is framed from the same
 /// boundary.
+/// Largest correction the output timeline may absorb per output packet when it
+/// finds itself ahead of the input stamps, in microseconds. 50 us per 10 ms
+/// packet is 5 ms per second: a sender packet stamped 30 ms late is worked off
+/// in six seconds, and a 50 ppm sample-clock-vs-wall-clock mismatch (50 us/s)
+/// is tracked with a hundredfold margin -- while a real gap still jumps at once.
+const SERVO_MAX_US: f64 = 50.0;
+
 pub struct Reframer {
     in_layout: PacketLayout,
     out_layout: PacketLayout,
@@ -52,11 +59,20 @@ pub struct Reframer {
     /// it used to keep, and a whole retained `Header` implied interactions with the
     /// timeline that never existed.
     pending_anchor_ms: Option<u64>,
-    /// Timestamp for the next output packet, in milliseconds since the epoch, used
-    /// when no input header is available to anchor it. See `drain`.
-    next_out_ts_ms: u64,
-    /// Duration of one output packet in milliseconds, the step of that timeline.
-    out_packet_ms: u64,
+    /// Timestamp for the next output packet, in microseconds since the epoch, used
+    /// when no input header is available to anchor it. See `drain`. Microseconds
+    /// because the per-packet advance is `10 ms * step`, a non-integer number of
+    /// milliseconds whose rounding error would otherwise accumulate.
+    next_out_ts_us: f64,
+    /// Input samples per output packet at step 1.0, i.e. `out_layout.spp`, kept
+    /// with the sample rate to convert a step into an advance in time.
+    out_spp: usize,
+    sample_rate: usize,
+    /// Duration of one INPUT packet in microseconds: an anchor that leads the
+    /// extrapolation by at least this much is a genuine gap in the input; less
+    /// than that is framing slack (the anchor is the first input packet pushed
+    /// after the previous output, up to one input packet late).
+    in_packet_us: f64,
     /// Linear fade multiplier, 0.0..=1.0, and where it is heading.
     gain: f64,
     gain_target: f64,
@@ -87,8 +103,10 @@ impl Reframer {
             device_id,
             out_pkt_id: 0,
             pending_anchor_ms: None,
-            next_out_ts_ms: 0,
-            out_packet_ms: (out_layout.spp as u64 * 1000 / sample_rate as u64).max(1),
+            next_out_ts_us: 0.0,
+            out_spp: out_layout.spp,
+            sample_rate,
+            in_packet_us: in_layout.spp as f64 * 1_000_000.0 / sample_rate as f64,
             gain: 1.0,
             gain_target: 1.0,
             gain_step: 1.0 / fade_samples as f64,
@@ -134,7 +152,7 @@ impl Reframer {
     /// clock, and that is the one case where the output timestamps *should* jump rather
     /// than stay monotonic.
     pub fn reset_timeline(&mut self) {
-        self.next_out_ts_ms = 0;
+        self.next_out_ts_us = 0.0;
         self.pending_anchor_ms = None;
     }
 
@@ -185,24 +203,48 @@ impl Reframer {
 
         while self.acc.iter().all(|a| a.len() >= self.out_layout.spp) {
             let mut buf = vec![0u8; self.out_layout.packet_len()];
-            // Header timestamps name the *start* of a packet's audio, so an output
-            // packet is stamped with the first input packet that contributed to it.
-            // When there is none — during concealment, or when one drain frames two
-            // packets because `step` is below 1.0 and the accumulator has run ahead —
-            // the timeline is *extrapolated* rather than left at zero. Borrowing a
-            // zeroed header there put 1970 on every silence packet and on roughly
-            // every fortieth packet at the ordinary drift-correcting step.
-            // Monotonic: an anchor is only taken if it does not move the timeline
-            // backwards. Extrapolation can outrun the input — during an outage, or
-            // whenever the consumer reads faster than the sender sends — and snapping
-            // back to a fresher-but-older input stamp made the sequence go backwards by
-            // as much as it had run ahead. A genuine clock change comes with a proven
-            // sender restart, and `reset_timeline` is how that one is expressed.
-            let ts_ms = match self.pending_anchor_ms.take() {
-                Some(ts) if ts >= self.next_out_ts_ms => ts,
-                _ => self.next_out_ts_ms,
+            // Header timestamps name the *start* of a packet's audio.
+            //
+            // The timeline advances by the INPUT time this packet actually contains:
+            // the resampler consumes exactly `step` input samples per output sample
+            // (a shared Q32 phase, see clocksync), so one output packet spans
+            // `out_spp * step` input samples. Advancing by a fixed output duration
+            // instead -- the previous rule -- was only right at step 1.0: at the
+            // lower clamp the timeline gained 25 ms per second over the audio it
+            // described, every real anchor then measured as "behind" and was
+            // refused by the monotonic rule, and the stamps ran ahead of real time
+            // without bound. A consumer computing latency from them saw it go
+            // negative.
+            //
+            // Anchors (the first input header pushed since the previous output)
+            // are read three ways. Leading the extrapolation by at least one input
+            // packet: a genuine gap in the input, jump forward to it. Behind it:
+            // we have run ahead -- a late-stamped sender packet once pulled the
+            // timeline forward, or the sender's wall clock runs slow against its
+            // sample clock -- so the next advance is shortened to servo back
+            // without ever stepping backwards (the stamps stay monotonic; they
+            // simply advance a little slower than the content for a while).
+            // Within one input packet of the extrapolation: framing slack, ignore.
+            let advance_us = self.out_spp as f64 * step * 1_000_000.0 / self.sample_rate as f64;
+            let mut servo_us = 0.0;
+            let ts_us = match self.pending_anchor_ms.take() {
+                Some(anchor_ms) => {
+                    let anchor_us = anchor_ms as f64 * 1000.0;
+                    if anchor_us >= self.next_out_ts_us + self.in_packet_us {
+                        anchor_us
+                    } else {
+                        if anchor_us < self.next_out_ts_us {
+                            servo_us = (self.next_out_ts_us - anchor_us).min(SERVO_MAX_US);
+                        }
+                        self.next_out_ts_us
+                    }
+                }
+                None => self.next_out_ts_us,
             };
-            self.next_out_ts_ms = ts_ms + self.out_packet_ms;
+            // The servo never takes more than half an advance, so the timeline
+            // keeps moving forward through any correction.
+            self.next_out_ts_us = ts_us + (advance_us - servo_us).max(advance_us * 0.5);
+            let ts_ms = (ts_us / 1000.0) as u64;
             Header {
                 device_id: self.device_id,
                 secs: (ts_ms / 1000) as u32,
@@ -265,6 +307,20 @@ mod tests {
             device_id: 5,
             secs: 100,
             ms,
+            pkt_id,
+        }
+        .write_to(&mut buf);
+        Bytes::from(buf)
+    }
+
+    /// Like `stamped`, but at an absolute time in ms since the epoch -- for the
+    /// long-running timeline tests that span whole seconds.
+    fn stamped_abs(l: &PacketLayout, t_ms: u64, pkt_id: i32) -> Bytes {
+        let mut buf = vec![0u8; l.packet_len()];
+        Header {
+            device_id: 5,
+            secs: (t_ms / 1000) as u32,
+            ms: (t_ms % 1000) as i16,
             pkt_id,
         }
         .write_to(&mut buf);
@@ -680,5 +736,96 @@ mod tests {
             slow.drain(1.0, &mut os);
         }
         assert!(of.len() < os.len(), "fast={} slow={}", of.len(), os.len());
+    }
+    /// The timeline must advance by the input time an output packet contains --
+    /// `10 ms * step` -- not by a fixed 10 ms. At the lower clamp the old rule
+    /// gained 25 ms per second over the audio it described, refused every real
+    /// anchor as "behind", and ran ahead of real time without bound; a consumer
+    /// computing latency from the stamps saw it go negative. Here 2 ms input
+    /// packets are stamped at their true times for 20 s at step 0.975, and the
+    /// output stamps must stay at or behind the latest input stamp throughout.
+    #[test]
+    fn stamps_never_run_ahead_of_the_input_at_a_slow_step() {
+        let (li, lo) = layouts(32, 160);
+        let mut r = Reframer::new(li, lo, 5, 16000, 20);
+        let mut out = Vec::new();
+        let mut max_lead_ms: i64 = i64::MIN;
+        let mut last_out_ms = 0u64;
+        for k in 0..10_000i32 {
+            // True capture time of packet k: base 100 s + 2 ms * k.
+            let t_ms = 100_000 + 2 * k as u64;
+            r.push_packet(&stamped_abs(&li, t_ms, k));
+            r.drain(0.975, &mut out);
+            if let Some(p) = out.last() {
+                let h = Header::parse(p).unwrap();
+                let o = h.secs as u64 * 1000 + h.ms as u64;
+                assert!(o >= last_out_ms, "timeline went backwards");
+                last_out_ms = o;
+                max_lead_ms = max_lead_ms.max(o as i64 - t_ms as i64);
+            }
+        }
+        // Framing slack is at most one input packet (2 ms); anything beyond it
+        // is the runaway this test exists to catch (the old rule reached ~500 ms).
+        assert!(
+            max_lead_ms <= 2,
+            "output stamps led the input by {} ms at step 0.975",
+            max_lead_ms
+        );
+        // ...and not stuck behind either: with 10 s of input at 0.975 the output
+        // timeline covers the same input span.
+        let behind_ms = (100_000 + 2 * 9_999) as i64 - last_out_ms as i64;
+        assert!(
+            behind_ms < 50,
+            "timeline fell {} ms behind the input",
+            behind_ms
+        );
+    }
+
+    /// One late-stamped sender packet pulls the timeline forward (it looks like
+    /// a gap); the servo must then work the lead off within seconds without the
+    /// stamps ever stepping backwards.
+    #[test]
+    fn a_late_stamp_is_worked_off_by_the_servo() {
+        let (li, lo) = layouts(32, 160);
+        let mut r = Reframer::new(li, lo, 5, 16000, 20);
+        let mut out = Vec::new();
+        let mut lead_after = Vec::new();
+        let mut last_out_ms = 0u64;
+        for k in 0..6_000i32 {
+            let true_ms = 100_000 + 2 * k as u64;
+            // A scheduler hiccup stamps a burst of five packets 30 ms late: five,
+            // so that whichever of them lands as the anchor of its output packet
+            // carries the late stamp (anchors are the FIRST input since the
+            // previous output, and the framing offset depends on the
+            // resampler's tap priming).
+            let stamp = if (500..505).contains(&k) {
+                true_ms + 30
+            } else {
+                true_ms
+            };
+            r.push_packet(&stamped_abs(&li, stamp, k));
+            r.drain(1.0, &mut out);
+            if let Some(p) = out.last() {
+                let h = Header::parse(p).unwrap();
+                let o = h.secs as u64 * 1000 + h.ms as u64;
+                assert!(o >= last_out_ms, "timeline went backwards");
+                last_out_ms = o;
+                if k > 500 {
+                    lead_after.push(o as i64 - true_ms as i64);
+                }
+            }
+        }
+        let peak = *lead_after.iter().max().unwrap();
+        let settled = *lead_after.last().unwrap();
+        assert!(
+            peak >= 20,
+            "the late stamp was not even taken up: peak lead {}",
+            peak
+        );
+        assert!(
+            settled <= 2,
+            "servo failed to work off the lead: still {} ms ahead after 11 s",
+            settled
+        );
     }
 }
