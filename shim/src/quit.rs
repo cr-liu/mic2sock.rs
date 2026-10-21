@@ -125,7 +125,8 @@ mod imp {
                     SetConsoleMode(h, mode);
                     return;
                 }
-                if rec.EventType == KEY_EVENT {
+                // EventType is a u16 field; the constant is declared u32.
+                if u32::from(rec.EventType) == KEY_EVENT {
                     let k = rec.Event.KeyEvent;
                     if k.bKeyDown != 0 {
                         let ch = k.uChar.UnicodeChar;
