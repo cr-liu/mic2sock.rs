@@ -49,13 +49,10 @@ const REORDER_WINDOW_MS: u64 = 160;
 /// to ~8x real time, and one tick can never stall the loop against a deep
 /// all-silent buffer.
 const RELEASE_BUDGET_PER_TICK: usize = 40;
-/// Releases held back from elision so a tick can always still frame its output
-/// packet: eliding may consume budget only while more than this remains. One
-/// output needs at most 6 pushed inputs (5 * 1.025, rounded up); 8 is that with
-/// margin. Without the reserve a quiet backlog let elision take 39 of 40
-/// releases, pushed one input per tick, and starved the consumer to one output
-/// packet per five ticks (review round 15).
-const PUSH_RESERVE: usize = 8;
+/// Extra releases kept beyond the computed push reserve (see `run_with_sink`):
+/// the reserve itself is derived from the geometry and the upper clamp, since a
+/// constant sized for 32-sample inputs starved 16-sample ones (round 16).
+const PUSH_RESERVE_MARGIN: usize = 2;
 /// Depth of the channel to the sink, in packets.
 ///
 /// Small on purpose, though it is no longer the release clock (the pacer is): it
@@ -218,6 +215,23 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
 
     let packet_ms = cfg.packet_ms_in();
     let out_packet_ms = cfg.packet_ms();
+    // Releases held back from elision so a tick can always still frame its
+    // output packet: eliding may consume budget only while more than this
+    // remains. One output packet needs ceil(out_spp * (1 + clamp) / spp_in)
+    // pushed inputs at the fast clamp -- 6 for 32-sample inputs, 11 for
+    // 16-sample ones -- plus margin. A fixed 8 starved the 16-sample geometry
+    // to one output per two ticks (round 16); without any reserve a quiet
+    // backlog let elision take 39 of 40 releases and starved the consumer to
+    // one output per five ticks (round 15).
+    let push_reserve = (out_layout.spp as f64 * (1.0 + cfg.catchup_clamp) / in_layout.spp as f64)
+        .ceil() as usize
+        + PUSH_RESERVE_MARGIN;
+    assert!(
+        push_reserve < RELEASE_BUDGET_PER_TICK,
+        "release budget {} cannot cover the push reserve {}",
+        RELEASE_BUDGET_PER_TICK,
+        push_reserve
+    );
     let mut gate = EnergyGate::new(packet_ms);
     // Splice continuity: the final samples of the last pushed real packet, and
     // whether any packet was elided since. Cleared on non-real releases -- the
@@ -397,7 +411,7 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
                         // release, not the residue after it.
                         let depth_ms = (jb.buffered() as u64 + 1) * packet_ms;
                         if gate.should_elide(&p, &in_layout, now, depth_ms, est.target_ms())
-                            && budget > PUSH_RESERVE
+                            && budget > push_reserve
                         {
                             m.silence_elided += 1;
                             splice_pending = true;

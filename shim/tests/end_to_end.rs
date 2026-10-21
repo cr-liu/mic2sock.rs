@@ -494,8 +494,11 @@ async fn silence_elision_drains_a_quiet_backlog_fast() {
         speech_packets
     );
     let at = marker_at.expect("marker never arrived: the quiet backlog was not elided");
+    // One output per 10 ms tick: a single missed tick would read as 20 ms, so
+    // the bound sits below that with room for scheduler jitter (round 16: a
+    // 35 ms bound accepted exactly the one-output-per-two-ticks starvation).
     assert!(
-        max_gap_ms < 35.0,
+        max_gap_ms < 16.0,
         "consumer starved: {:.0} ms between output packets during the drain",
         max_gap_ms
     );
