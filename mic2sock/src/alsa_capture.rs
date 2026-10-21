@@ -144,6 +144,10 @@ pub fn run_capture(
     let n_ch = dev.n_channel;
     let pkt_len = header_len + n_ch * spp * 2;
     let packet_time_len = (spp * 1000 / cfg.mic.sample_rate) as i16;
+    // readi returns once the last frame of the packet has reached the buffer,
+    // and ALSA hands frames over one hardware period at a time, so the packet's
+    // first sample was captured about one packet plus one period ago.
+    let period_ms = (cfg.mic.period * 1000 / cfg.mic.sample_rate).max(1) as u128;
     let device_id = cfg.mic.device_id as u16;
     let bps = dev.fmt.bytes_per_sample();
 
@@ -182,15 +186,17 @@ pub fn run_capture(
             }
         }
 
-        // Header: identical arithmetic to the JACK-era process_send_buf --
-        // back-dated by a 10 ms fudge minus one packet duration, so the
-        // timestamp names the start of the packet's audio.
+        // Header: back-dated by one hardware period plus one packet duration,
+        // so the timestamp names the start of the packet's audio. The JACK-era
+        // code used a flat 10 ms here, sized for 160-sample packets and a jackd
+        // buffer that no longer exists; at 2 ms packets it overstated the
+        // capture latency fourfold and every downstream latency figure with it.
         let mut pkt = vec![0_u8; pkt_len];
         let unix_time_in_millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis()
-            - 10;
+            - period_ms;
         let mut secs = (unix_time_in_millis / 1000) as u32;
         let mut ms = (unix_time_in_millis % 1000) as i16 - packet_time_len;
         if ms < 0 {
