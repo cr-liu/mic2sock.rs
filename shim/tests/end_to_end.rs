@@ -450,6 +450,13 @@ async fn silence_elision_drains_a_quiet_backlog_fast() {
     let mut c0 = vec![0i16; l_out.spp];
     let mut speech_packets = 0;
     let mut marker_at = None;
+    // Output is paced one packet per 10 ms tick regardless of how fast the
+    // backlog drains: a run of elided input must never starve the consumer
+    // (review round 15 found one output per five ticks when elision took 39
+    // of 40 releases), and a drain framing two packets must not emit both.
+    let mut last_read = None::<std::time::Instant>;
+    let mut max_gap_ms = 0.0f64;
+    let mut min_gap_ms = f64::MAX;
 
     // Without elision the 260 packets of room tone play for 520 ms: the marker
     // arrives around output packet 112 at the earliest. With elision draining
@@ -457,6 +464,15 @@ async fn silence_elision_drains_a_quiet_backlog_fast() {
     // enough to be scheduling-proof but firmly below the no-elision floor.
     for i in 0..112 {
         let buf = read_one_packet(&mut consumer, l_out.packet_len()).await;
+        let now = std::time::Instant::now();
+        if let Some(prev) = last_read {
+            let gap = now.duration_since(prev).as_secs_f64() * 1e3;
+            if i > 2 {
+                max_gap_ms = max_gap_ms.max(gap);
+                min_gap_ms = min_gap_ms.min(gap);
+            }
+        }
+        last_read = Some(now);
         deblock_channel(&buf, &l_out, 0, &mut c0);
         if c0.iter().any(|&s| s.abs() > 1200 && s.abs() < 2400) {
             speech_packets += 1;
@@ -478,6 +494,16 @@ async fn silence_elision_drains_a_quiet_backlog_fast() {
         speech_packets
     );
     let at = marker_at.expect("marker never arrived: the quiet backlog was not elided");
+    assert!(
+        max_gap_ms < 35.0,
+        "consumer starved: {:.0} ms between output packets during the drain",
+        max_gap_ms
+    );
+    assert!(
+        min_gap_ms > 4.0,
+        "two output packets left in one tick ({:.1} ms apart)",
+        min_gap_ms
+    );
     // Without elision the marker cannot arrive before output packet 112
     // (560 input packets at 1x). The bound sits below that floor with room
     // for the hangover and the disarm tail.

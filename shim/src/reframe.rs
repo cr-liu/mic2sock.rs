@@ -39,11 +39,11 @@ use protocol::{next_pkt_id, Header, PacketLayout};
 /// alignment, and that is unaffected: every channel is framed from the same
 /// boundary.
 /// Largest correction the output timeline may absorb per output packet when it
-/// finds itself ahead of the input stamps, in microseconds. 50 us per 10 ms
+/// finds itself ahead of the input stamps, in nanoseconds. 50 us per 10 ms
 /// packet is 5 ms per second: a sender packet stamped 30 ms late is worked off
 /// in six seconds, and a 50 ppm sample-clock-vs-wall-clock mismatch (50 us/s)
 /// is tracked with a hundredfold margin -- while a real gap still jumps at once.
-const SERVO_MAX_US: f64 = 50.0;
+const SERVO_MAX_NS: u64 = 50_000;
 
 pub struct Reframer {
     in_layout: PacketLayout,
@@ -59,20 +59,23 @@ pub struct Reframer {
     /// it used to keep, and a whole retained `Header` implied interactions with the
     /// timeline that never existed.
     pending_anchor_ms: Option<u64>,
-    /// Timestamp for the next output packet, in microseconds since the epoch, used
-    /// when no input header is available to anchor it. See `drain`. Microseconds
-    /// because the per-packet advance is `10 ms * step`, a non-integer number of
-    /// milliseconds whose rounding error would otherwise accumulate.
-    next_out_ts_us: f64,
+    /// Timestamp for the next output packet, in integer nanoseconds since the
+    /// epoch, used when no input header is available to anchor it. See `drain`.
+    /// Sub-millisecond because the per-packet advance is `10 ms * step`; an
+    /// integer because an f64 at epoch magnitude has a 0.25 us ulp, which
+    /// rounded a 9750.1 us advance to 9750.0 and lost 864 ms over a day of
+    /// anchorless concealment (review round 15). At 1 ns the per-packet
+    /// rounding is 0.5 ns, ~40 us/day, and u64 holds the epoch in ns until 2554.
+    next_out_ts_ns: u64,
     /// Input samples per output packet at step 1.0, i.e. `out_layout.spp`, kept
     /// with the sample rate to convert a step into an advance in time.
     out_spp: usize,
     sample_rate: usize,
-    /// Duration of one INPUT packet in microseconds: an anchor that leads the
+    /// Duration of one INPUT packet in nanoseconds: an anchor that leads the
     /// extrapolation by at least this much is a genuine gap in the input; less
     /// than that is framing slack (the anchor is the first input packet pushed
     /// after the previous output, up to one input packet late).
-    in_packet_us: f64,
+    in_packet_ns: u64,
     /// Linear fade multiplier, 0.0..=1.0, and where it is heading.
     gain: f64,
     gain_target: f64,
@@ -103,10 +106,10 @@ impl Reframer {
             device_id,
             out_pkt_id: 0,
             pending_anchor_ms: None,
-            next_out_ts_us: 0.0,
+            next_out_ts_ns: 0,
             out_spp: out_layout.spp,
             sample_rate,
-            in_packet_us: in_layout.spp as f64 * 1_000_000.0 / sample_rate as f64,
+            in_packet_ns: in_layout.spp as u64 * 1_000_000_000 / sample_rate as u64,
             gain: 1.0,
             gain_target: 1.0,
             gain_step: 1.0 / fade_samples as f64,
@@ -152,7 +155,7 @@ impl Reframer {
     /// clock, and that is the one case where the output timestamps *should* jump rather
     /// than stay monotonic.
     pub fn reset_timeline(&mut self) {
-        self.next_out_ts_us = 0.0;
+        self.next_out_ts_ns = 0;
         self.pending_anchor_ms = None;
     }
 
@@ -225,26 +228,27 @@ impl Reframer {
             // without ever stepping backwards (the stamps stay monotonic; they
             // simply advance a little slower than the content for a while).
             // Within one input packet of the extrapolation: framing slack, ignore.
-            let advance_us = self.out_spp as f64 * step * 1_000_000.0 / self.sample_rate as f64;
-            let mut servo_us = 0.0;
-            let ts_us = match self.pending_anchor_ms.take() {
+            let advance_ns =
+                (self.out_spp as f64 * step * 1e9 / self.sample_rate as f64).round() as u64;
+            let mut servo_ns = 0u64;
+            let ts_ns = match self.pending_anchor_ms.take() {
                 Some(anchor_ms) => {
-                    let anchor_us = anchor_ms as f64 * 1000.0;
-                    if anchor_us >= self.next_out_ts_us + self.in_packet_us {
-                        anchor_us
+                    let anchor_ns = anchor_ms * 1_000_000;
+                    if anchor_ns >= self.next_out_ts_ns + self.in_packet_ns {
+                        anchor_ns
                     } else {
-                        if anchor_us < self.next_out_ts_us {
-                            servo_us = (self.next_out_ts_us - anchor_us).min(SERVO_MAX_US);
+                        if anchor_ns < self.next_out_ts_ns {
+                            servo_ns = (self.next_out_ts_ns - anchor_ns).min(SERVO_MAX_NS);
                         }
-                        self.next_out_ts_us
+                        self.next_out_ts_ns
                     }
                 }
-                None => self.next_out_ts_us,
+                None => self.next_out_ts_ns,
             };
             // The servo never takes more than half an advance, so the timeline
             // keeps moving forward through any correction.
-            self.next_out_ts_us = ts_us + (advance_us - servo_us).max(advance_us * 0.5);
-            let ts_ms = (ts_us / 1000.0) as u64;
+            self.next_out_ts_ns = ts_ns + (advance_ns - servo_ns).max(advance_ns / 2);
+            let ts_ms = ts_ns / 1_000_000;
             Header {
                 device_id: self.device_id,
                 secs: (ts_ms / 1000) as u32,

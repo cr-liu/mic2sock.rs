@@ -49,6 +49,13 @@ const REORDER_WINDOW_MS: u64 = 160;
 /// to ~8x real time, and one tick can never stall the loop against a deep
 /// all-silent buffer.
 const RELEASE_BUDGET_PER_TICK: usize = 40;
+/// Releases held back from elision so a tick can always still frame its output
+/// packet: eliding may consume budget only while more than this remains. One
+/// output needs at most 6 pushed inputs (5 * 1.025, rounded up); 8 is that with
+/// margin. Without the reserve a quiet backlog let elision take 39 of 40
+/// releases, pushed one input per tick, and starved the consumer to one output
+/// packet per five ticks (review round 15).
+const PUSH_RESERVE: usize = 8;
 /// Depth of the channel to the sink, in packets.
 ///
 /// Small on purpose, though it is no longer the release clock (the pacer is): it
@@ -361,13 +368,20 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
         // released packets that measure as room tone are elided (dropped without
         // reaching the reframer) within the same per-tick budget, so a backlog
         // drains at several times real time without touching speech.
+        //
+        // Exactly one output packet leaves per tick. A drain can frame two at
+        // once (legacy 160-sample inputs at step < 1 accumulate a surplus), and
+        // sending both would put the consumption floor at one input per tick
+        // regardless of step -- the open loop again for that geometry. So any
+        // surplus stays in `pending`, and a tick that already holds a framed
+        // packet releases no input at all: it just sends.
         let now = now_ms();
         let mut budget = RELEASE_BUDGET_PER_TICK;
         // A resync inside release_with_target skips the release position over
         // a gap too wide to conceal; the packet it lands on was never adjacent
         // to what preceded it, so it needs the same joint ramp as an elision.
         let resyncs_before = jb.resync_events;
-        loop {
+        while pending.is_empty() {
             budget -= 1;
             match jb.release_with_target(now, target_packets) {
                 Released::Real(p) => {
@@ -383,7 +397,7 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
                         // release, not the residue after it.
                         let depth_ms = (jb.buffered() as u64 + 1) * packet_ms;
                         if gate.should_elide(&p, &in_layout, now, depth_ms, est.target_ms())
-                            && budget > 0
+                            && budget > PUSH_RESERVE
                         {
                             m.silence_elided += 1;
                             splice_pending = true;
@@ -449,12 +463,13 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
                 Released::Nothing => break,
             }
             refr.drain(ctl.step(), &mut pending);
-            if !pending.is_empty() || budget == 0 {
+            if budget == 0 {
                 break;
             }
         }
 
-        for p in pending.drain(..) {
+        if !pending.is_empty() {
+            let p = pending.remove(0);
             // Usually instant (the queue is two deep and the consumer keeps up).
             // When the consumer stalls this blocks, ticks coalesce in their shallow
             // channel, and releases stop -- depth then grows where the accounting
