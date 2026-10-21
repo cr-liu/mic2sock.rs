@@ -78,6 +78,11 @@ pub struct Config {
     /// Where to append JSONL metrics. `None` disables metrics output.
     #[serde(default)]
     pub metrics_path: Option<PathBuf>,
+    /// Where informational events go (source reconnects, consumer attach and
+    /// detach, startup). The console carries errors only; without a log file
+    /// the informational stream is simply dropped.
+    #[serde(default)]
+    pub log_path: Option<PathBuf>,
     /// Drop released source packets that measure as room tone while the buffer
     /// is deeper than target + margin, so a backlog drains at up to 16x real
     /// time instead of the resampler's 2.5%. Loses only near-silence; speech

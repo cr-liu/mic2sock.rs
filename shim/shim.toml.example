@@ -81,6 +81,12 @@ keep_source_when_idle = true
 # non-uniformly.
 silence_elision = true
 
+# Informational events -- source reconnects, consumer attach/detach, startup --
+# are appended here with UTC timestamps. The console carries errors only (config,
+# bind, geometry, the safety valve); without a log file the informational stream
+# is simply dropped.
+# log_path = "C:/mic/shim.log"
+
 # Append one JSON object per minute here. This is the instrument for answering "how
 # low can this link actually go" (read p99_9_ms) and for judging whether a change
 # helped. Comment out to disable.

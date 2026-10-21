@@ -300,19 +300,21 @@ impl TcpSource {
             match TcpStream::connect(&addr).await {
                 Ok(mut sock) => {
                     let _ = sock.set_nodelay(true);
-                    eprintln!("source: connected to {}", addr);
+                    crate::log::info(&format!("source: connected to {}", addr));
                     backoff.reset();
                     if tx.send(SourceEvent::Connected).await.is_err() {
                         return Ok(()); // pipeline shut down
                     }
                     match self.pump(&mut sock, &tx).await {
                         Ok(()) => {}
-                        Err(PumpError::Io(e)) => eprintln!("source: {} ({})", e, addr),
+                        Err(PumpError::Io(e)) => {
+                            crate::log::info(&format!("source: {} ({})", e, addr))
+                        }
                         Err(PumpError::Fatal(msg)) => return Err(msg),
                     }
-                    eprintln!("source: disconnected from {}", addr);
+                    crate::log::info(&format!("source: disconnected from {}", addr));
                 }
-                Err(e) => eprintln!("source: connect to {} failed: {}", addr, e),
+                Err(e) => crate::log::info(&format!("source: connect to {} failed: {}", addr, e)),
             }
             if tx.is_closed() {
                 return Ok(());

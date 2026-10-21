@@ -84,7 +84,10 @@ pub async fn run(cfg: Config) {
     {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("shim: cannot bind localhost:{}: {}", cfg.sink_port, e);
+            crate::log::error(&format!(
+                "shim: cannot bind localhost:{}: {}",
+                cfg.sink_port, e
+            ));
             std::process::exit(EXIT_BIND);
         }
     };
@@ -206,7 +209,7 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
         // dropped `Result` inside a spawned task it would be invisible, and the shim
         // would sit there forwarding mis-framed audio for as long as nobody looked.
         if let Err(e) = src.run(src_tx).await {
-            eprintln!("shim: {}", e);
+            crate::log::error(&format!("shim: {}", e));
             std::process::exit(EXIT_GEOMETRY);
         }
     });
@@ -342,7 +345,10 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
         let dropped = jb.enforce_max_depth(max_depth_packets);
         if dropped > 0 {
             m.max_depth_hit += 1;
-            eprintln!("shim: max_depth exceeded, discarded {} packets", dropped);
+            crate::log::error(&format!(
+                "shim: max_depth exceeded, discarded {} packets",
+                dropped
+            ));
         }
 
         // The depth controller runs on wall time, not per packet — and only while the
@@ -505,8 +511,10 @@ pub async fn run_with_sink(cfg: Config, sink: Sink) {
             m.duplicate_discards = jb.duplicate_discards;
             m.resync_events = jb.resync_events;
             m.set_last_flush(t);
+            // The metrics line goes to its own file only: the console carries
+            // errors, and a line a minute of JSON is exactly the noise that made
+            // the real errors invisible.
             let line = m.to_json_line(t, est.target_ms(), ctl.step());
-            eprintln!("{}", line);
             if let Some(path) = &cfg.metrics_path {
                 if let Ok(mut f) = std::fs::OpenOptions::new()
                     .create(true)

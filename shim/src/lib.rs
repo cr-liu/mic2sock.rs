@@ -6,6 +6,7 @@ pub mod config;
 pub mod depth;
 pub mod elide;
 pub mod jitter;
+pub mod log;
 pub mod metrics;
 pub mod pipeline;
 pub mod reframe;

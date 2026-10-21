@@ -77,6 +77,16 @@ boundaries, so the "headers" it reads are garbage. The first eight packets of ev
 connection are checked for that (ids advancing by one, milliseconds in range), and a
 mismatch is fatal rather than an hour of silently mis-framed audio.
 
+## Console and log
+
+The console carries **errors only**: a bad config, a port that will not bind, a
+stream that contradicts the configured geometry, the safety valve firing. Everything
+informational -- source reconnects, consumer attach and detach, the startup banner --
+is appended to `log_path` with UTC timestamps, and simply dropped if no log file is
+configured. The per-minute metrics line goes to `metrics_path` alone. A shim running
+in a console window is therefore silent while healthy; type `q` and Enter to quit it
+cleanly (closing the window also works, less gracefully).
+
 ## Reading the metrics
 
 With `metrics_path` set, one JSON object is appended per minute. Three fields answer

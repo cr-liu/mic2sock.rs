@@ -72,7 +72,7 @@ impl Sink {
         let _ = sock.set_nodelay(true);
         let want = self.pkt_len * SNDBUF_PACKETS;
         if let Err(e) = socket2::SockRef::from(&sock).set_send_buffer_size(want) {
-            eprintln!("sink: could not set SO_SNDBUF to {}: {}", want, e);
+            crate::log::error(&format!("sink: could not set SO_SNDBUF to {}: {}", want, e));
         }
         // Reassigning `current` drops any previous stream, which closes it — that
         // close is what tells a displaced consumer it has been replaced.
@@ -108,13 +108,13 @@ impl Sink {
                     match accepted {
                         Ok((sock, peer)) => {
                             if current.is_some() {
-                                eprintln!("sink: {} replaces the previous consumer", peer);
+                                crate::log::info(&format!("sink: {} replaces the previous consumer", peer));
                             } else {
-                                eprintln!("sink: consumer connected from {}", peer);
+                                crate::log::info(&format!("sink: consumer connected from {}", peer));
                             }
                             self.install(&mut current, sock);
                         }
-                        Err(e) => eprintln!("sink: accept failed: {}", e),
+                        Err(e) => crate::log::error(&format!("sink: accept failed: {}", e)),
                     }
                 }
                 item = rx.recv() => {
@@ -136,20 +136,20 @@ impl Sink {
                             biased;
                             res = write => {
                                 if let Err(e) = res {
-                                    eprintln!("sink: consumer write failed: {}", e);
+                                    crate::log::info(&format!("sink: consumer write failed: {}", e));
                                     self.drop_consumer(&mut current);
                                 }
                             }
                             accepted = self.listener.accept() => {
                                 match accepted {
                                     Ok((sock, peer)) => {
-                                        eprintln!(
+                                        crate::log::info(&format!(
                                             "sink: {} replaces a consumer that stopped reading",
                                             peer
-                                        );
+                                        ));
                                         self.install(&mut current, sock);
                                     }
-                                    Err(e) => eprintln!("sink: accept failed: {}", e),
+                                    Err(e) => crate::log::error(&format!("sink: accept failed: {}", e)),
                                 }
                             }
                         }
