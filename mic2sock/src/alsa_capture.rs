@@ -72,9 +72,31 @@ pub enum OpenError {
 /// the process on the recoverable one (review round 15).
 fn classify(dev: &str, what: &str, e: alsa::Error) -> OpenError {
     let msg = format!("{}: {}: {}", dev, what, e);
+    // Transient: the device is absent, busy, resetting, or the USB transport
+    // underneath it hiccupped. hw_params runs snd_pcm_prepare, which on a USB
+    // device issues control transfers that can time out (ETIMEDOUT) or fail
+    // with the USB stack's own codes (EPROTO/EILSEQ/EREMOTEIO/ESHUTDOWN/
+    // ENOLINK) while the device is mid-reset -- all worth waiting out
+    // (round 16: ETIMEDOUT during a reopen was fatal and ended the process).
+    // Everything else -- EINVAL, ENOTSUP, EACCES, EPERM, EBADFD, ENOMEM --
+    // describes the request or the process, and waiting cannot change it.
     match e.errno() as i32 {
-        libc::ENODEV | libc::ENXIO | libc::ENOENT | libc::EIO | libc::EBUSY | libc::EAGAIN
-        | libc::EINTR | libc::EPIPE | libc::ESTRPIPE => OpenError::Transient(msg),
+        libc::ENODEV
+        | libc::ENXIO
+        | libc::ENOENT
+        | libc::EIO
+        | libc::EBUSY
+        | libc::EAGAIN
+        | libc::EINTR
+        | libc::EPIPE
+        | libc::ESTRPIPE
+        | libc::ETIMEDOUT
+        | libc::EPROTO
+        | libc::EILSEQ
+        | libc::EREMOTEIO
+        | libc::ESHUTDOWN
+        | libc::ENOLINK
+        | libc::ENOTCONN => OpenError::Transient(msg),
         _ => OpenError::Fatal(msg),
     }
 }
