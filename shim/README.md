@@ -79,12 +79,13 @@ mismatch is fatal rather than an hour of silently mis-framed audio.
 
 ## Console and log
 
-The console carries **errors only**: a bad config, a port that will not bind, a
-stream that contradicts the configured geometry, the safety valve firing. Everything
-informational -- source reconnects, consumer attach and detach, the startup banner --
-is appended to `log_path` with UTC timestamps, and simply dropped if no log file is
-configured. The per-minute metrics line goes to `metrics_path` alone. A shim running
-in a console window is therefore silent while healthy; press `q` (no Enter) or Ctrl+C
+The console carries connection events -- source connect and disconnect, consumer
+attach and detach, the startup banner -- and errors: a bad config, a port that will
+not bind, a stream that contradicts the configured geometry, the safety valve firing.
+Both are also appended to `log_path` with UTC timestamps when a log file is
+configured. Nothing periodic is printed: the per-minute metrics line goes to
+`metrics_path` alone, so a healthy shim's window changes only when a connection
+does. Press `q` (no Enter) or Ctrl+C
 to quit it cleanly. The key is read only when stdin is a real console -- a pipe,
 `/dev/null` or a scheduled task without a window leaves the console mode untouched and
 the shim running unattended.

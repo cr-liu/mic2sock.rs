@@ -1,11 +1,13 @@
-//! Two-level logging with a quiet console.
+//! Two-level logging: events and errors on the console, mirrored to a file.
 //!
-//! The console (stderr) carries **errors only** -- conditions that need an
-//! operator: a config or bind failure, a geometry mismatch, the safety valve
-//! firing. Everything informational -- source reconnects, consumer attach/
-//! detach, the startup banner -- goes to the log file named by `log_path`,
-//! silently, and is dropped when no file is configured. The per-minute metrics
-//! line is not logged at all: it has its own file (`metrics_path`).
+//! The console carries what an operator glancing at the window wants to see:
+//! connection events -- source connect/disconnect, consumer attach/detach, the
+//! startup banner -- on stdout, and errors -- a config or bind failure, a
+//! geometry mismatch, the safety valve firing -- on stderr. Both are also
+//! appended, with UTC stamps, to the log file named by `log_path` when one is
+//! configured. Nothing periodic is printed anywhere: the per-minute metrics
+//! line has its own file (`metrics_path`), so a healthy shim's window stays
+//! still between connection changes.
 //!
 //! No crate dependency: a `Mutex<Option<File>>` is const-constructible on the
 //! declared MSRV, and the UTC stamp is thirty lines of civil-date arithmetic.
@@ -18,8 +20,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static FILE: Mutex<Option<File>> = Mutex::new(None);
 
-/// Opens (appending) the log file. Without a path, informational output is
-/// discarded and only errors reach the console.
+/// Opens (appending) the log file. Without a path, output reaches the console
+/// only.
 pub fn init(path: Option<&Path>) -> Result<(), String> {
     if let Some(p) = path {
         let f = OpenOptions::new()
@@ -32,8 +34,9 @@ pub fn init(path: Option<&Path>) -> Result<(), String> {
     Ok(())
 }
 
-/// Informational: file only.
+/// Connection events and other one-off state changes: stdout and file.
 pub fn info(msg: &str) {
+    println!("{}", msg);
     write_file("INFO", msg);
 }
 

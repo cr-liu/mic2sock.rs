@@ -17,8 +17,8 @@ fn main() {
             std::process::exit(EXIT_CONFIG);
         }
     };
-    // The console is for errors only from here on; everything informational
-    // goes to log_path (and nowhere, if none is configured).
+    // From here on the console shows connection events and errors, each also
+    // appended to log_path when one is configured; nothing periodic.
     if let Err(e) = shim_lib::log::init(cfg.log_path.as_deref()) {
         eprintln!("shim: {}", e);
         std::process::exit(EXIT_CONFIG);
