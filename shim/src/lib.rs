@@ -9,6 +9,7 @@ pub mod jitter;
 pub mod log;
 pub mod metrics;
 pub mod pipeline;
+pub mod quit;
 pub mod reframe;
 pub mod sink;
 pub mod source;

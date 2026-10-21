@@ -267,11 +267,13 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "clocksync",
+ "libc",
  "protocol",
  "serde",
  "socket2",
  "tokio",
  "toml",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

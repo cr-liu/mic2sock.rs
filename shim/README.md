@@ -84,8 +84,10 @@ stream that contradicts the configured geometry, the safety valve firing. Everyt
 informational -- source reconnects, consumer attach and detach, the startup banner --
 is appended to `log_path` with UTC timestamps, and simply dropped if no log file is
 configured. The per-minute metrics line goes to `metrics_path` alone. A shim running
-in a console window is therefore silent while healthy; type `q` and Enter to quit it
-cleanly (closing the window also works, less gracefully).
+in a console window is therefore silent while healthy; press `q` (no Enter) or Ctrl+C
+to quit it cleanly. The key is read only when stdin is a real console -- a pipe,
+`/dev/null` or a scheduled task without a window leaves the console mode untouched and
+the shim running unattended.
 
 ## Reading the metrics
 

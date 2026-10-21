@@ -33,38 +33,11 @@ fn main() {
         cfg.layout().packet_len()
     ));
 
-    spawn_console_quit();
+    shim_lib::quit::spawn();
 
     tokio::runtime::Runtime::new()
         .expect("failed to start the tokio runtime")
         .block_on(pipeline::run(cfg));
-}
-
-/// `q` + Enter on the console exits cleanly (code 0). A line read rather than a
-/// raw keypress: raw mode would need a terminal crate, and a bare `q` typed into
-/// the wrong window is exactly the accident Enter protects against.
-///
-/// When stdin is not a terminal -- the Windows scheduled task runs with no
-/// console at all -- `read_line` returns EOF at once. EOF ends this thread and
-/// nothing else: treating it as a quit would stop every unattended instance the
-/// moment it started.
-fn spawn_console_quit() {
-    std::thread::spawn(|| {
-        let stdin = std::io::stdin();
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match stdin.read_line(&mut line) {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {
-                    if matches!(line.trim(), "q" | "Q" | "quit") {
-                        shim_lib::log::info("shim: quit requested from the console");
-                        std::process::exit(0);
-                    }
-                }
-            }
-        }
-    });
 }
 
 /// `--config <path>`, the only argument. Anything else is a usage error rather than

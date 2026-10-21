@@ -20,3 +20,12 @@ path = "src/lib.rs"
 [[bin]]
 name = "shim"
 path = "src/main.rs"
+
+# Bare-key quit (src/quit.rs): raw-mode console reads with no terminal crate.
+# Both are already in the lockfile -- libc via alsa/nix, windows-sys 0.48 via
+# tokio -- so neither adds a dependency version, only API surface.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.48", features = ["Win32_Foundation", "Win32_System_Console"] }
