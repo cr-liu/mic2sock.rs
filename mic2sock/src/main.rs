@@ -5,7 +5,7 @@ mod alsa_capture;
 mod config_file;
 mod tcp_server;
 
-use alsa_capture::{open_capture, run_capture};
+use alsa_capture::{open_with_retry, run_capture};
 use config_file::Config;
 use tcp_server::start_server;
 
@@ -34,7 +34,12 @@ async fn main() {
         println!("note: jackd is no longer used; capturing directly via ALSA");
     }
 
-    let (capture_dev, n_mic) = open_capture(&cfg);
+    // The array may not have enumerated yet when the fleet brings modules up
+    // at boot, so the first open waits for it like a reopen would. A device
+    // that is present but cannot do the configured geometry panics inside.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let capture_dev = open_with_retry(&cfg, &shutdown).expect("shutdown before first open");
+    let n_mic = capture_dev.n_channel;
     cfg.mic.n_channel = n_mic;
     let cfg = Arc::new(cfg);
 
@@ -48,7 +53,6 @@ async fn main() {
     let backlog_packets = 3000 / (cfg.tcp_sender.sample_per_packet * 1000 / cfg.mic.sample_rate);
     let (packet_sender, _keep_channel_open) = broadcast::channel(backlog_packets);
 
-    let shutdown = Arc::new(AtomicBool::new(false));
     let panic_flag = Arc::new(AtomicBool::new(false));
 
     let cfg_cp = cfg.clone();
