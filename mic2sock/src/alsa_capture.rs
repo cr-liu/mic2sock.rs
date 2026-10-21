@@ -21,7 +21,7 @@
 use crate::config_file::Config;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
 use alsa::pcm::{Access, Format, HwParams, PCM};
@@ -65,6 +65,20 @@ pub enum OpenError {
     Fatal(String),
 }
 
+/// Sorts an ALSA error by its errno, not by where it happened: a device that
+/// vanished mid-open fails `HwParams::any` with ENODEV (transient), and a
+/// device we are not allowed to open fails `PCM::new` with EACCES (fatal) --
+/// so classifying by call site retried the hopeless case forever and killed
+/// the process on the recoverable one (review round 15).
+fn classify(dev: &str, what: &str, e: alsa::Error) -> OpenError {
+    let msg = format!("{}: {}: {}", dev, what, e);
+    match e.errno() as i32 {
+        libc::ENODEV | libc::ENXIO | libc::ENOENT | libc::EIO | libc::EBUSY | libc::EAGAIN
+        | libc::EINTR | libc::EPIPE | libc::ESTRPIPE => OpenError::Transient(msg),
+        _ => OpenError::Fatal(msg),
+    }
+}
+
 /// Opens the capture device and negotiates format/rate/geometry.
 ///
 /// The requested channel count is clamped to what the hardware exposes, the
@@ -74,10 +88,9 @@ pub enum OpenError {
 /// than stream subtly wrong audio -- repo convention).
 pub fn open_capture(cfg: &Config) -> Result<CaptureDevice, OpenError> {
     let dev = &cfg.mic.device_name;
-    let pcm = PCM::new(dev, Direction::Capture, false)
-        .map_err(|e| OpenError::Transient(format!("cannot open {}: {}", dev, e)))?;
+    let pcm = PCM::new(dev, Direction::Capture, false).map_err(|e| classify(dev, "open", e))?;
 
-    let fatal = |what: &str, e: alsa::Error| OpenError::Fatal(format!("{}: {}: {}", dev, what, e));
+    let fatal = |what: &str, e: alsa::Error| classify(dev, what, e);
 
     let fmt;
     let n_channel;
@@ -130,10 +143,9 @@ pub fn open_capture(cfg: &Config) -> Result<CaptureDevice, OpenError> {
             .map_err(|e| fatal("periods", e))?;
 
         // Installing the parameters is the one step that touches the device
-        // for real; a device that just vanished fails here with EIO/ENODEV,
-        // and that is transient like a failed open.
-        pcm.hw_params(&hwp)
-            .map_err(|e| OpenError::Transient(format!("{}: hw_params: {}", dev, e)))?;
+        // for real; a device that just vanished fails here with EIO/ENODEV
+        // (transient), an incompatible parameter set with EINVAL (fatal).
+        pcm.hw_params(&hwp).map_err(|e| fatal("hw_params", e))?;
     }
 
     Ok(CaptureDevice { pcm, fmt, n_channel })
@@ -143,6 +155,10 @@ pub fn open_capture(cfg: &Config) -> Result<CaptureDevice, OpenError> {
 /// seconds; a device that is gone for longer is probably unplugged, and one
 /// log line per eight seconds is a tolerable heartbeat while it is.
 const REOPEN_BACKOFF_MAX: Duration = Duration::from_secs(8);
+
+/// How long a device must have streamed for its next loss to count as a fresh
+/// incident (backoff reset) rather than the same one still going on.
+const HEALTHY_RUN: Duration = Duration::from_secs(5);
 
 /// Opens the device, retrying transient failures with doubling backoff
 /// (1, 2, 4, 8, 8, ... s) until it succeeds, the process is shutting down
@@ -346,6 +362,14 @@ pub fn run_capture(
     let mut xruns = 0_u64;
     let mut reopens = 0_u64;
     let mut dev = dev;
+    // Backoff for the open-succeeds-then-dies-at-once cycle. open_with_retry
+    // only waits between FAILED opens; a device that opens fine and then
+    // returns ENODATA/EIO on the first read would otherwise be reopened in a
+    // tight loop with no sleep at all -- a log flood, and under SCHED_FIFO a
+    // core pinned. The backoff grows while the device keeps dying young and
+    // resets only after it has streamed for HEALTHY_RUN.
+    let mut reopen_backoff = Duration::from_secs(1);
+    let mut opened_at = Instant::now();
 
     loop {
         match capture_from(&dev, &mut packer, &packet_sender, &shutdown, &mut xruns) {
@@ -355,6 +379,24 @@ pub fn run_capture(
             }
         }
         drop(dev);
+        if opened_at.elapsed() >= HEALTHY_RUN {
+            reopen_backoff = Duration::from_secs(1);
+        } else {
+            println!(
+                "capture device died {:.1}s after opening; waiting {}s before reopening",
+                opened_at.elapsed().as_secs_f64(),
+                reopen_backoff.as_secs()
+            );
+            let deadline = Instant::now() + reopen_backoff;
+            while Instant::now() < deadline {
+                if shutdown.load(Ordering::SeqCst) {
+                    println!("capture thread exiting during reopen backoff");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            reopen_backoff = (reopen_backoff * 2).min(REOPEN_BACKOFF_MAX);
+        }
         // The panic path for a fatal open lives inside open_with_retry; a
         // panic on this thread must still fail the process, hence the guard.
         let reopened = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -376,6 +418,7 @@ pub fn run_capture(
             return;
         }
         reopens += 1;
+        opened_at = Instant::now();
         println!("capture resumed (reopen #{}, pkt_id continues at {})", reopens, packer.pkt_id);
         dev = reopened;
     }
